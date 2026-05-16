@@ -171,17 +171,43 @@ def authenticate_user(username: str, password: str):
 
 # ── CHECK-OUT TỪNG CA ─────────────────────────────────────────────────────────
 def checkout_ca(ma_cham_cong: int) -> tuple[bool, str]:
-    """Check-out 1 ca theo id ChamCong. Trả (True, msg) hoặc (False, lỗi)."""
+    """Check-out 1 ca theo id ChamCong (số nguyên).
+
+    Trả (True, msg) khi thành công, (False, lỗi) khi thất bại.
+
+    Lưu ý: hàm này chỉ nhận ma_cham_cong là int — KHÔNG nhận NhanVien object
+    hay ma_phien. UI cần gọi lay_ca_dang_mo() trước để lấy danh sách id.
+    """
+    # Guard kiểu dữ liệu — bắt lỗi sớm thay vì để crash tận DB
+    if not isinstance(ma_cham_cong, int):
+        return False, (
+            f"ma_cham_cong phải là int, nhận được {type(ma_cham_cong).__name__}. "
+            "Hãy truyền cc['id'] từ lay_ca_dang_mo()."
+        )
+
     session = get_session()
     try:
         now = datetime.now()
         cc  = session.get(ChamCong, ma_cham_cong)
         if not cc:
-            return False, "Không tìm thấy bản ghi chấm công."
+            return False, f"Không tìm thấy bản ghi chấm công #{ma_cham_cong}."
         if cc.thoi_gian_ra is not None:
             return False, "Ca này đã được check-out rồi."
         if cc.thoi_gian_vao is None:
-            return False, "Ca chưa check-in."
+            # Ca tồn tại nhưng chưa check-in (ví dụ Chua_checkin) —
+            # ghi thời gian vào = now để tránh kẹt, đánh dấu Hoan_thanh
+            cc.thoi_gian_vao = now
+            cc.trang_thai    = "Hoan_thanh"
+            cc.thoi_gian_ra  = now
+            cc.phut_ve_som   = 0
+            cc.phut_tang_ca  = 0
+            if cc.ma_phien:
+                phien = session.get(PhienLamViec, cc.ma_phien)
+                if phien and phien.dang_hoat_dong:
+                    phien.thoi_gian_dang_xuat = now
+                    phien.dang_hoat_dong      = False
+            session.commit()
+            return True, f"Check-out {now.strftime('%H:%M')} | (Ca chưa check-in — tự động đóng)"
 
         info = _tinh_checkout(now, cc)
         cc.thoi_gian_ra  = now
@@ -205,9 +231,28 @@ def checkout_ca(ma_cham_cong: int) -> tuple[bool, str]:
     except Exception as e:
         try: session.rollback()
         except Exception: pass
-        return False, str(e)
+        return False, f"Lỗi DB: {e}"
     finally:
         session.close()
+
+
+def checkout_tat_ca_ca(ma_nv: int) -> tuple[bool, str]:
+    """Checkout toàn bộ ca đang mở (Dang_lam / Di_tre) của nhân viên hôm nay.
+
+    Đây là hàm tiện ích cho UI gọi khi đăng xuất — thay thế pattern
+    gọi checkout_ca(NhanVien, ma_phien=...) sai kiểu cũ.
+    Trả (True, tóm_tắt) nếu tất cả thành công, (False, chi_tiết_lỗi) nếu có lỗi.
+    """
+    cas = lay_ca_dang_mo(ma_nv)
+    if not cas:
+        return True, "Không có ca đang mở"
+    ok_msgs, err_msgs = [], []
+    for ca in cas:
+        ok, msg = checkout_ca(ca["id"])
+        (ok_msgs if ok else err_msgs).append(f"{ca['ten_ca']}: {msg}")
+    if err_msgs:
+        return False, "Lỗi: " + " | ".join(err_msgs)
+    return True, " | ".join(ok_msgs)
 
 
 def lay_ca_dang_mo(ma_nv: int) -> list[dict]:

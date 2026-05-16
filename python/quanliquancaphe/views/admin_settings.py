@@ -194,7 +194,8 @@ class EmployeeForm(QDialog):
 
         self.txt_name  = QLineEdit();  self.txt_name.setPlaceholderText("Nguyễn Văn A")
         self.txt_user  = QLineEdit();  self.txt_user.setPlaceholderText("nhanvien01")
-        self.txt_sdt   = QLineEdit();  self.txt_sdt.setPlaceholderText("0901234567")
+        from utils.phone_validator import PhoneLineEdit
+        self.txt_sdt   = PhoneLineEdit()
         self.txt_email = QLineEdit();  self.txt_email.setPlaceholderText("nv@quancafe.vn")
         self.txt_luong = QLineEdit();  self.txt_luong.setPlaceholderText("5000000")
 
@@ -275,6 +276,14 @@ class EmployeeForm(QDialog):
 
         if not name or not user:
             QMessageBox.warning(self, "Thiếu thông tin", "Họ tên và tên đăng nhập là bắt buộc!")
+            return
+
+        if not self.txt_sdt.is_valid():
+            QMessageBox.warning(self, "SĐT không hợp lệ",
+                "Số điện thoại không hợp lệ!\n"
+                "Phải gồm đúng 10 chữ số và đúng đầu số nhà mạng\n"
+                "(03x, 05x, 07x, 08x, 09x).")
+            self.txt_sdt.setFocus()
             return
 
         luong = 0.0

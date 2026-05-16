@@ -576,7 +576,7 @@ class SystemLogDialog(QDialog):
         self.t2 = PromoLogTab()
 
         self.tabs.addTab(self.t0, "🔐  Nhật Ký Đăng Nhập")   # ← Thay "Hệ thống"
-        self.tabs.addTab(self.t1, "👤  Nhật Ký Nhân Viên")
+        self.tabs.addTab(self.t1, "👤  Nhật Ký Hoạt Động")
         self.tabs.addTab(self.t2, "🏷️  Nhật Ký Khuyến Mãi")
         root.addWidget(self.tabs)
 

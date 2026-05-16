@@ -21,6 +21,7 @@ def process_checkout(
     nhan_vien_id: int,
     km_id: int = None,
     km_discount: float = 0,
+    khach_hang_id: int = None,
 ) -> tuple[bool, str]:
     """
     Tạo HoaDon + ChiTietHoaDon từ danh sách món đã order.
@@ -49,6 +50,7 @@ def process_checkout(
         hoa_don = HoaDon(
             ma_phien   = phien.id,
             ma_km      = km_id,
+            ma_kh      = khach_hang_id,
             tong_tien  = grand_total,
             thue       = vat,
             giam_gia   = float(km_discount),

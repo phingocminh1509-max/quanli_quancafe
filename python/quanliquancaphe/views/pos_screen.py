@@ -25,7 +25,7 @@ from PySide6.QtCore import Qt, Signal, QEvent
 from PySide6.QtGui import QPixmap, QColor, QIntValidator
 
 from database.db_config import get_session
-from database.models import SanPham, DanhMuc, KhuyenMai
+from database.models import SanPham, KhuyenMai
 from controllers.pos_controller import process_checkout
 
 # ── Palette ──────────────────────────────────────────────────────────────────
@@ -469,7 +469,9 @@ class InvoiceTable(QTableWidget):
         self._refresh()
 
     def eventFilter(self, obj, event):
-        if self._qty_le is not None and obj is self._qty_le:
+        if (hasattr(self, "_qty_le") and
+                self._qty_le is not None and
+                obj is self._qty_le):
             if event.type() == QEvent.KeyPress:
                 if event.key() in (Qt.Key_Return, Qt.Key_Enter):
                     self._commit_qty()
@@ -704,30 +706,40 @@ class POSScreen(QWidget):
         root.addWidget(sep)
         root.addWidget(right_w)
 
-        self._all_products: list[dict]   = []
-        self._cat_names:    dict[int,str] = {}
+        self._all_products: list[dict]      = []
+        self._cat_names:    list[str]       = []   # danh sách tên danh mục (string)
         self._cat_btns:     list[QPushButton] = []
-        self._current_cat:  int | None   = None
+        self._current_cat:  str | None      = None  # tên danh mục đang chọn (string)
         self._load_products()
 
     # ── Load sản phẩm ────────────────────────────────────────────
     def _load_products(self):
+        """Tải sản phẩm từ DB; danh mục là SanPham.danh_muc (string)."""
         s = get_session()
         try:
-            cats = s.query(DanhMuc).order_by(DanhMuc.id).all()
-            sps  = s.query(SanPham).filter_by(trang_thai=True).all()
-            self._cat_names    = {c.id: c.ten_danh_muc for c in cats}
+            sps = (s.query(SanPham)
+                   .filter(SanPham.trang_thai == "Đang bán")
+                   .order_by(SanPham.danh_muc, SanPham.ten_sp)
+                   .all())
             self._all_products = [
                 {
                     "name":  sp.ten_sp,
                     "price": float(sp.gia_ban or 0),
-                    "cat":   sp.ma_danh_muc,
+                    "cat":   (sp.danh_muc or "Khác").strip(),
                     "hinh":  sp.hinh_anh,
                 }
                 for sp in sps
             ]
         finally:
             s.close()
+
+        # Gom danh mục duy nhất theo thứ tự xuất hiện
+        seen: list[str] = []
+        for p in self._all_products:
+            if p["cat"] not in seen:
+                seen.append(p["cat"])
+        self._cat_names = seen
+
         self._build_cat_bar()
         self._render_products(self._all_products)
 
@@ -747,12 +759,12 @@ class POSScreen(QWidget):
         self._cat_bar.addWidget(btn_all)
         self._cat_btns.append(btn_all)
 
-        for cid, cname in self._cat_names.items():
+        for cname in self._cat_names:
             b = QPushButton(cname)
             b.setCheckable(True)
             b.setCursor(Qt.PointingHandCursor)
             b.setStyleSheet(self._cs(False))
-            b.clicked.connect(lambda _, ci=cid, btn=b: self._set_cat(ci, btn))
+            b.clicked.connect(lambda _, cn=cname, btn=b: self._set_cat(cn, btn))
             self._cat_bar.addWidget(b)
             self._cat_btns.append(b)
 
@@ -767,8 +779,8 @@ class POSScreen(QWidget):
             f"QPushButton:hover {{ background:{ACCENT}; }}"
         )
 
-    def _set_cat(self, cat_id: int | None, active_btn: QPushButton):
-        self._current_cat = cat_id
+    def _set_cat(self, cat_name: str | None, active_btn: QPushButton):
+        self._current_cat = cat_name
         for b in self._cat_btns:
             b.setChecked(b is active_btn)
             b.setStyleSheet(self._cs(b is active_btn))
@@ -789,12 +801,13 @@ class POSScreen(QWidget):
             if item.widget():
                 item.widget().deleteLater()
 
-        by_cat: dict = {}
+        # Nhóm theo tên danh mục (string)
+        by_cat: dict[str, list] = {}
         for p in products:
             by_cat.setdefault(p["cat"], []).append(p)
 
-        for cat_id, items in by_cat.items():
-            lbl = QLabel(self._cat_names.get(cat_id, "Khác"))
+        for cat_name, items in by_cat.items():
+            lbl = QLabel(cat_name)
             lbl.setStyleSheet(
                 f"color:{ACCENT}; font-size:14px; font-weight:bold;"
                 f" border-bottom:1px solid {BORDER}; padding-bottom:4px;"

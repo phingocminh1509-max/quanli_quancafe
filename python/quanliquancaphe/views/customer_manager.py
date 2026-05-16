@@ -101,7 +101,8 @@ class CustomerForm(QDialog):
 
         form = QFormLayout(); form.setSpacing(10)
         self.txt_ten  = QLineEdit(); self.txt_ten.setPlaceholderText("Nguyễn Văn A")
-        self.txt_sdt  = QLineEdit(); self.txt_sdt.setPlaceholderText("0901234567")
+        from utils.phone_validator import PhoneLineEdit
+        self.txt_sdt  = PhoneLineEdit()
         self.txt_mail = QLineEdit(); self.txt_mail.setPlaceholderText("kh@email.com")
         self.txt_note = QLineEdit(); self.txt_note.setPlaceholderText("Ghi chú…")
 
@@ -144,6 +145,13 @@ class CustomerForm(QDialog):
         ten  = self.txt_ten.text().strip()
         if not ten:
             QMessageBox.warning(self, "Thiếu", "Họ tên là bắt buộc!"); return
+
+        if not self.txt_sdt.is_valid():
+            QMessageBox.warning(self, "SĐT không hợp lệ",
+                "Số điện thoại không hợp lệ!\n"
+                "Phải gồm đúng 10 chữ số và đúng đầu số nhà mạng (03x, 05x, 07x, 08x, 09x).")
+            self.txt_sdt.setFocus()
+            return
 
         sdt  = self.txt_sdt.text().strip() or None
         mail = self.txt_mail.text().strip() or None
