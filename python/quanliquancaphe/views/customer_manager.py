@@ -188,49 +188,33 @@ class CustomerForm(QDialog):
 # DIALOG ĐIỂM: TÍCH hoặc TRỪ
 # ═══════════════════════════════════════════════════════════════════════════════
 class PointDialog(QDialog):
-    """
-    Dùng chung cho cả Tích điểm và Trừ điểm.
-    mode = 'add' | 'deduct'
-    """
-    def __init__(self, kh_id: int, ten_kh: str, diem_hien: int,
-                 mode: str = 'add', parent=None):
+    """Tích điểm / Cộng điểm thủ công."""
+    def __init__(self, kh_id: int, ten_kh: str, diem_hien: int, parent=None):
         super().__init__(parent)
         self.kh_id = kh_id
-        self.mode  = mode
-        title = "Tích Điểm" if mode == 'add' else "Trừ / Đổi Điểm"
-        self.setWindowTitle(f"{title} — {ten_kh}")
-        self.resize(360, 230)
+        self.setWindowTitle(f"⭐ Tích Điểm — {ten_kh}")
+        self.resize(360, 210)
         self.setStyleSheet(STYLE)
 
         root = QVBoxLayout(self)
-        root.setContentsMargins(24, 24, 24, 24); root.setSpacing(12)
-
-        color = "#2ECC71" if mode == 'add' else "#E67E22"
-        icon  = "⭐ Tích điểm" if mode == 'add' else "🔄 Trừ/Đổi điểm"
-        root.addWidget(_lbl(f"{icon}  |  Điểm hiện tại: <b>{diem_hien:,}</b>", color, 13, True))
+        root.setContentsMargins(24, 20, 24, 20); root.setSpacing(12)
+        root.addWidget(_lbl(
+            f"⭐ Tích điểm  |  Điểm hiện tại: <b>{diem_hien:,}</b>",
+            "#2ECC71", 13, True
+        ))
 
         form = QFormLayout(); form.setSpacing(10)
+        self.cb_loai = QComboBox()
+        self.cb_loai.addItems(["Tích điểm mua hàng", "Điều chỉnh tăng", "Thưởng điểm"])
         self.sp_diem = QSpinBox()
-        self.sp_diem.setRange(1, 999_999)
-        self.sp_diem.setValue(100)
-
-        if mode == 'add':
-            self.cb_loai = QComboBox()
-            self.cb_loai.addItems(["Tích điểm", "Điều chỉnh tăng"])
-            form.addRow(_fl("Loại:"),    self.cb_loai)
-        else:
-            self.cb_loai = QComboBox()
-            self.cb_loai.addItems(["Đổi điểm lấy quà", "Trừ điểm phạt", "Điều chỉnh giảm"])
-            form.addRow(_fl("Lý do:"),   self.cb_loai)
-
+        self.sp_diem.setRange(1, 999_999); self.sp_diem.setValue(10)
+        self.txt_ly  = QLineEdit(); self.txt_ly.setPlaceholderText("Ghi chú thêm…")
+        form.addRow(_fl("Loại:"),     self.cb_loai)
         form.addRow(_fl("Số điểm:"),  self.sp_diem)
-        self.txt_ly = QLineEdit(); self.txt_ly.setPlaceholderText("Ghi chú thêm…")
         form.addRow(_fl("Ghi chú:"),  self.txt_ly)
         root.addLayout(form)
 
-        btn_color = "#27AE60" if mode == 'add' else "#E67E22"
-        btn_text  = "✅ Cộng điểm" if mode == 'add' else "➖ Trừ điểm"
-        btn = _btn(btn_text, btn_color, 44)
+        btn = _btn("✅  Cộng điểm", "#27AE60", 44)
         btn.clicked.connect(self._save)
         root.addWidget(btn)
 
@@ -238,14 +222,381 @@ class PointDialog(QDialog):
         diem = self.sp_diem.value()
         loai = self.cb_loai.currentText()
         ly   = self.txt_ly.text().strip() or loai
+        s = get_session()
+        try:
+            kh = s.query(KhachHang).filter_by(id=self.kh_id).first()
+            if not kh:
+                QMessageBox.critical(self, "Lỗi", "Không tìm thấy khách hàng!"); return
+            kh.diem_tich_luy   = (kh.diem_tich_luy or 0) + diem
+            kh.hang_thanh_vien = tinh_hang(kh.tong_chi_tieu or 0)
+            s.add(LichSuDiemKH(ma_kh=self.kh_id, loai="Tích điểm",
+                                so_diem=diem, mo_ta=f"{loai}: {ly}"))
+            s.commit(); self.accept()
+        except Exception as e:
+            s.rollback(); QMessageBox.critical(self, "Lỗi", str(e))
+        finally:
+            s.close()
 
-        # Tính delta: cộng hay trừ
-        if self.mode == 'add':
-            delta = diem
-            loai_log = "Tích điểm"
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# DIALOG ĐỔI ĐIỂM — chọn KM đổi điểm, xem preview ưu đãi
+# ═══════════════════════════════════════════════════════════════════════════════
+class RedeemDialog(QDialog):
+    """
+    Đổi điểm tích lũy lấy ưu đãi.
+    Hiển thị danh sách KM loại 'DoiDiem' còn hiệu lực,
+    cho phép chọn và xác nhận đổi (trừ điểm + ghi log).
+    """
+    def __init__(self, kh_id: int, ten_kh: str, diem_hien: int, parent=None):
+        super().__init__(parent)
+        self.kh_id     = kh_id
+        self.diem_hien = diem_hien
+        self.setWindowTitle(f"🎁 Đổi Điểm — {ten_kh}")
+        self.resize(680, 520)
+        self.setStyleSheet(STYLE + """
+            QFrame#card { background:#252538; border-radius:10px;
+                border:1px solid #3E3E55; }
+            QFrame#card:hover { border-color:#E67E22; }
+            QListWidget { background:#2D2D3F; border:1px solid #3E3E55;
+                border-radius:8px; color:white; font-size:13px; }
+            QListWidget::item { padding:10px 12px; border-bottom:1px solid #3E3E55; }
+            QListWidget::item:selected { background:#E67E22; color:white; }
+        """)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(20, 18, 20, 18); root.setSpacing(12)
+
+        # ── Tiêu đề + điểm hiện tại ─────────────────────────────
+        hdr = QHBoxLayout()
+        hdr.addWidget(_lbl("🎁  ĐỔI ĐIỂM TÍCH LŨY", "#E67E22", 15, True))
+        hdr.addStretch()
+        self.lbl_diem = _lbl(
+            f"Điểm hiện có: <b style='color:#F1C40F;font-size:18px;'>"
+            f"{diem_hien:,}</b> điểm",
+            "white", 13
+        )
+        self.lbl_diem.setTextFormat(Qt.RichText)
+        hdr.addWidget(self.lbl_diem)
+        root.addLayout(hdr)
+
+        # ── Splitter: trái = danh sách KM | phải = preview ──────
+        from PySide6.QtWidgets import QSplitter, QListWidget, QListWidgetItem, QScrollArea
+        splitter = QSplitter(Qt.Horizontal)
+        splitter.setHandleWidth(2)
+        splitter.setStyleSheet("QSplitter::handle{background:#3E3E55;}")
+
+        # Trái: lọc + danh sách
+        left = QWidget(); left.setStyleSheet("background:transparent;")
+        lv = QVBoxLayout(left); lv.setContentsMargins(0,0,6,0); lv.setSpacing(8)
+
+        # Thanh lọc
+        from PySide6.QtWidgets import QLineEdit as _LE
+        self.txt_search = _LE()
+        self.txt_search.setPlaceholderText("🔍 Tìm khuyến mãi...")
+        self.txt_search.textChanged.connect(self._filter_list)
+        lv.addWidget(self.txt_search)
+
+        lv.addWidget(_lbl("Chọn ưu đãi muốn đổi:", "#A1A1AA", 12))
+        from PySide6.QtWidgets import QListWidget, QListWidgetItem
+        self.lst = QListWidget()
+        self.lst.currentRowChanged.connect(self._on_select)
+        lv.addWidget(self.lst)
+        splitter.addWidget(left)
+
+        # Phải: preview card
+        right = QWidget(); right.setStyleSheet("background:transparent;")
+        rv = QVBoxLayout(right); rv.setContentsMargins(6,0,0,0); rv.setSpacing(10)
+        rv.addWidget(_lbl("👁  XEM TRƯỚC", "#A1A1AA", 11, True))
+
+        self.preview = QLabel()
+        self.preview.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+        self.preview.setWordWrap(True)
+        self.preview.setTextFormat(Qt.RichText)
+        self.preview.setStyleSheet(
+            "background:#1A1A2A;border-radius:10px;"
+            "border:1px solid #3E3E55;padding:16px;"
+            "color:white;font-size:13px;"
+        )
+        self.preview.setMinimumHeight(200)
+        rv.addWidget(self.preview)
+
+        # Nhập điểm thủ công (hiện khi diem_can = 0)
+        self._diem_manual_row = QWidget()
+        self._diem_manual_row.setStyleSheet("background:transparent;")
+        dr = QHBoxLayout(self._diem_manual_row)
+        dr.setContentsMargins(0,0,0,0); dr.setSpacing(8)
+        dr.addWidget(_lbl("Số điểm trừ:", "#A1A1AA", 12))
+        self.sp_diem_manual = QSpinBox()
+        self.sp_diem_manual.setRange(0, 999_999)
+        self.sp_diem_manual.setValue(0)
+        self.sp_diem_manual.setSuffix(" điểm")
+        self.sp_diem_manual.setSpecialValueText("Không trừ điểm")
+        self.sp_diem_manual.setStyleSheet(
+            "background:#2D2D3F;border:1px solid #3E3E55;border-radius:6px;"
+            "padding:6px 10px;color:white;font-size:13px;"
+        )
+        self.sp_diem_manual.setMaximum(diem_hien)
+        self.sp_diem_manual.valueChanged.connect(self._on_manual_diem_changed)
+        dr.addWidget(self.sp_diem_manual)
+        self._diem_manual_row.setVisible(False)
+        rv.addWidget(self._diem_manual_row)
+
+        # Ghi chú thêm
+        rv.addWidget(_lbl("Ghi chú (tuỳ chọn):", "#A1A1AA", 11))
+        self.txt_note = QLineEdit()
+        self.txt_note.setPlaceholderText("VD: Khách đổi quà sinh nhật...")
+        rv.addWidget(self.txt_note)
+        rv.addStretch()
+        splitter.addWidget(right)
+        splitter.setSizes([310, 310])
+        root.addWidget(splitter, stretch=1)
+
+        # ── Nút xác nhận ────────────────────────────────────────
+        btn_row = QHBoxLayout()
+        btn_cancel = _btn("✖ Hủy", "#555577", 44)
+        btn_cancel.clicked.connect(self.reject)
+        self.btn_redeem = _btn("🎁  Xác nhận đổi điểm", "#E67E22", 44)
+        self.btn_redeem.setEnabled(False)
+        self.btn_redeem.clicked.connect(self._confirm)
+        btn_row.addWidget(btn_cancel)
+        btn_row.addStretch()
+        btn_row.addWidget(self.btn_redeem)
+        root.addLayout(btn_row)
+
+        # Load dữ liệu
+        self._kms: list = []
+        self._filtered: list = []
+        self._sel_km = None
+        self._load_kms()
+
+    def _load_kms(self):
+        """Load tất cả KM đổi điểm còn hiệu lực."""
+        from database.models import KhuyenMai
+        from datetime import date as _date
+        s = get_session()
+        try:
+            today = _date.today()
+            all_kms = s.query(KhuyenMai).filter(
+                KhuyenMai.trang_thai == "Đang chạy"
+            ).all()
+
+            result = []
+            for km in all_kms:
+                # ── CHỈ lấy KM đổi điểm (la_doi_diem = 1) ──────────
+                if not int(getattr(km, 'la_doi_diem', 0) or 0):
+                    continue   # bỏ qua KM chung
+
+                # Kiểm tra ngày
+                if km.ngay_bat_dau and km.ngay_bat_dau > today: continue
+                if km.ngay_ket_thuc and km.ngay_ket_thuc < today: continue
+                # Kiểm tra lượt dùng
+                if km.so_luot_toi_da and (km.so_luot_da_dung or 0) >= km.so_luot_toi_da:
+                    continue
+
+                diem_can = int(getattr(km, 'diem_can', 0) or 0)
+                result.append({
+                    "km":       km,
+                    "id":       km.id,
+                    "ten":      km.ten_km or "—",
+                    "mo_ta":    getattr(km, 'mo_ta', '') or "",
+                    "diem_can": diem_can,
+                    "kieu":     km.kieu_giam or "",
+                    "gia_tri":  float(km.gia_tri_giam or 0),
+                    "tran":     float(km.toi_da_giam or 0) if km.toi_da_giam else None,
+                    "loai_km":  km.loai_km or "DonHang",
+                    "gio_tu":   getattr(km, 'gio_tu', None),
+                    "gio_den":  getattr(km, 'gio_den', None),
+                    "uu_tien":  int(getattr(km, 'uu_tien', 0) or 0),
+                })
+            # Sắp xếp: diem_can thấp lên trước (dễ đổi hơn), rồi uu_tien
+            result.sort(key=lambda x: (x["diem_can"] if x["diem_can"] > 0 else 999_999,
+                                        -x["uu_tien"], x["ten"]))
+            self._kms = result
+        finally:
+            s.close()
+
+        self._filtered = self._kms[:]
+        self._rebuild_list()
+
+    def _rebuild_list(self):
+        self.lst.blockSignals(True)
+        self.lst.clear()
+        for d in self._filtered:
+            du_diem = self.diem_hien >= d["diem_can"] if d["diem_can"] > 0 else True
+            icon = "✅" if du_diem else "🔒"
+            diem_str = f"  —  cần {d['diem_can']:,} điểm" if d["diem_can"] > 0 else "  —  không cần điểm"
+            if d["kieu"] == "PhanTram":
+                uu_dai = f"Giảm {int(d['gia_tri'])}%"
+            elif d["kieu"] == "TienMat":
+                uu_dai = f"Giảm {int(d['gia_tri']):,}đ"
+            elif d["loai_km"] == "MuaXTangY":
+                uu_dai = "Mua X Tặng Y"
+            else:
+                uu_dai = "Ưu đãi đặc biệt"
+            from PySide6.QtWidgets import QListWidgetItem
+            it = QListWidgetItem(f"{icon}  {d['ten']}\n     {uu_dai}{diem_str}")
+            it.setData(Qt.UserRole, d)
+            if not du_diem:
+                it.setForeground(QColor("#7070A0"))
+            self.lst.addItem(it)
+        self.lst.blockSignals(False)
+        # Auto-select first item → trigger preview
+        if self.lst.count() > 0:
+            self.lst.setCurrentRow(0)
+            self._on_select(0)
         else:
-            delta = -diem
-            loai_log = "Đổi điểm"
+            self._sel_km = None
+            self.preview.setText(
+                "<div style='color:#7070A0;text-align:center;padding:40px;'>"
+                "⚠️ Chưa có chương trình đổi điểm nào.<br><br>"
+                "<span style='font-size:12px;'>Vào <b>Quản lý Khuyến Mãi</b> → "
+                "chọn loại <b>🔢 Đổi Điểm</b> để tạo chương trình.</span>"
+                "</div>"
+            )
+            self.btn_redeem.setEnabled(False)
+
+    def _filter_list(self, text: str):
+        kw = text.strip().lower()
+        self._filtered = [
+            d for d in self._kms
+            if kw in d["ten"].lower() or kw in d["mo_ta"].lower()
+        ] if kw else self._kms[:]
+        self._rebuild_list()
+
+    def _on_manual_diem_changed(self, val: int):
+        """Cập nhật preview khi thay số điểm thủ công."""
+        if self._sel_km:
+            self._update_preview(self._sel_km)
+
+    def _on_select(self, row: int):
+        if row < 0 or row >= self.lst.count():
+            self._sel_km = None
+            self.preview.setText("")
+            self.btn_redeem.setEnabled(False)
+            self._diem_manual_row.setVisible(False)
+            return
+
+        it = self.lst.item(row)
+        if not it:
+            return
+        d = it.data(Qt.UserRole)
+        self._sel_km = d
+
+        # Hiện/ẩn ô nhập điểm thủ công
+        need_manual = (d["diem_can"] == 0)
+        self._diem_manual_row.setVisible(need_manual)
+        if need_manual:
+            self.sp_diem_manual.setMaximum(self.diem_hien)
+
+        self._update_preview(d)
+        du_diem = self.diem_hien >= d["diem_can"] if d["diem_can"] > 0 else True
+        self.btn_redeem.setEnabled(du_diem)
+        if d["diem_can"] > 0:
+            self.btn_redeem.setText(f"🎁  Đổi {d['diem_can']:,} điểm")
+        elif self.sp_diem_manual.value() > 0:
+            self.btn_redeem.setText(f"🎁  Trừ {self.sp_diem_manual.value():,} điểm")
+        else:
+            self.btn_redeem.setText("🎁  Áp dụng ưu đãi")
+
+    def _update_preview(self, d: dict):
+        # Số điểm thực sự sẽ trừ
+        diem_tru_thuc = d["diem_can"] if d["diem_can"] > 0 else (
+            self.sp_diem_manual.value() if hasattr(self, 'sp_diem_manual') else 0
+        )
+        du_diem = self.diem_hien >= d["diem_can"] if d["diem_can"] > 0 else True
+        status_color = "#2ECC71" if du_diem else "#E74C3C"
+        status_text  = "✅ Đủ điểm" if du_diem else f"❌ Thiếu {d['diem_can'] - self.diem_hien:,} điểm"
+
+        if d["kieu"] == "PhanTram":
+            uu_dai_html = f"<b style='color:#E74C3C;font-size:22px;'>{int(d['gia_tri'])}% OFF</b>"
+            if d["tran"]:
+                uu_dai_html += f"<br><span style='color:#F39C12;font-size:12px;'>Tối đa {int(d['tran']):,}đ</span>"
+        elif d["kieu"] == "TienMat":
+            uu_dai_html = f"<b style='color:#E74C3C;font-size:22px;'>−{int(d['gia_tri']):,}đ</b>"
+        elif d["loai_km"] == "MuaXTangY":
+            uu_dai_html = "<b style='color:#2ECC71;font-size:16px;'>🎁 Mua X Tặng Y</b>"
+        else:
+            uu_dai_html = "<b style='color:#3498DB;'>Ưu đãi đặc biệt</b>"
+
+        if d["diem_can"] > 0:
+            con_lai = self.diem_hien - d["diem_can"]
+            diem_html = f"""
+            <div style='background:#1A1A2E;border-radius:6px;padding:8px 12px;margin:8px 0;'>
+              🔢 Điểm cần dùng: <b style='color:#F1C40F;font-size:16px;'>{d['diem_can']:,}</b> điểm<br>
+              📊 Điểm hiện có: <b>{self.diem_hien:,}</b> điểm<br>
+              💳 Còn lại sau đổi: <b style='color:{"#2ECC71" if con_lai >= 0 else "#E74C3C"};'>
+                {max(0, con_lai):,}</b> điểm
+            </div>"""
+        elif diem_tru_thuc > 0:
+            con_lai = self.diem_hien - diem_tru_thuc
+            diem_html = f"""
+            <div style='background:#1A1A2E;border-radius:6px;padding:8px 12px;margin:8px 0;'>
+              🔢 Điểm sẽ trừ: <b style='color:#F1C40F;font-size:16px;'>{diem_tru_thuc:,}</b> điểm<br>
+              📊 Điểm hiện có: <b>{self.diem_hien:,}</b> điểm<br>
+              💳 Còn lại sau đổi: <b style='color:#2ECC71;'>{max(0, con_lai):,}</b> điểm
+            </div>"""
+        else:
+            diem_html = f"""
+            <div style='background:#1A1A2E;border-radius:6px;padding:8px 12px;margin:8px 0;'>
+              📊 Điểm hiện có: <b>{self.diem_hien:,}</b> điểm<br>
+              <span style='color:#A1A1AA;font-size:12px;'>Nhập số điểm muốn dùng ở ô bên dưới (0 = không trừ điểm)</span>
+            </div>"""
+
+        gio_html = ""
+        if d["gio_tu"] and d["gio_den"]:
+            gio_html = f"<br>🕐 Happy Hour: <b>{d['gio_tu'].strftime('%H:%M')}–{d['gio_den'].strftime('%H:%M')}</b>"
+
+        mo_ta_html = (
+            f"<p style='color:#A1A1AA;font-size:12px;margin:4px 0;'>{d['mo_ta']}</p>"
+            if d["mo_ta"] else ""
+        )
+
+        html = f"""
+        <div style='font-family:sans-serif;'>
+          <b style='font-size:15px;color:#E8E8F0;'>{d['ten']}</b><br>
+          {mo_ta_html}
+          <div style='text-align:center;padding:12px 0;'>
+            {uu_dai_html}
+          </div>
+          {diem_html}
+          <span style='color:{status_color};font-weight:bold;font-size:13px;'>{status_text}</span>
+          {gio_html}
+        </div>
+        """
+        self.preview.setText(html)
+
+    def _confirm(self):
+        d = self._sel_km
+        if not d:
+            return
+
+        # Xác định số điểm thực sự trừ
+        if d["diem_can"] > 0:
+            diem_tru = d["diem_can"]
+        else:
+            diem_tru = self.sp_diem_manual.value()  # 0 = không trừ điểm
+
+        note = self.txt_note.text().strip()
+        ten  = d["ten"]
+
+        # Kiểm tra đủ điểm
+        if diem_tru > 0 and self.diem_hien < diem_tru:
+            QMessageBox.warning(
+                self, "Không đủ điểm",
+                f"Khách chỉ có {self.diem_hien:,} điểm, cần {diem_tru:,} điểm!"
+            ); return
+
+        # Xác nhận
+        if diem_tru > 0:
+            msg = (f"Xác nhận trừ <b>{diem_tru:,} điểm</b> của khách để nhận:<br><br>"
+                   f"🎁 <b>{ten}</b>")
+        else:
+            msg = f"Áp dụng ưu đãi <b>{ten}</b> cho khách (không trừ điểm)?"
+        if QMessageBox.question(
+            self, "Xác nhận đổi điểm", msg,
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+        ) != QMessageBox.Yes:
+            return
 
         s = get_session()
         try:
@@ -253,87 +604,282 @@ class PointDialog(QDialog):
             if not kh:
                 QMessageBox.critical(self, "Lỗi", "Không tìm thấy khách hàng!"); return
 
-            new_diem = max(0, (kh.diem_tich_luy or 0) + delta)
+            if diem_tru > 0:
+                if (kh.diem_tich_luy or 0) < diem_tru:
+                    QMessageBox.warning(
+                        self, "Không đủ điểm",
+                        f"Khách chỉ còn {kh.diem_tich_luy or 0:,} điểm!"
+                    ); return
+                kh.diem_tich_luy = (kh.diem_tich_luy or 0) - diem_tru
 
-            if self.mode == 'deduct' and new_diem == 0 and diem > (kh.diem_tich_luy or 0):
-                QMessageBox.warning(
-                    self, "Không đủ điểm",
-                    f"Khách chỉ có {kh.diem_tich_luy or 0} điểm, không đủ để trừ {diem}!"
-                )
-                return
+            kh.hang_thanh_vien = tinh_hang(kh.tong_chi_tieu or 0)
 
-            kh.diem_tich_luy    = new_diem
-            kh.hang_thanh_vien  = tinh_hang(kh.tong_chi_tieu or 0)
-
+            mo_ta = f"Đổi điểm: {ten}"
+            if note: mo_ta += f" — {note}"
             s.add(LichSuDiemKH(
                 ma_kh=self.kh_id,
-                loai=loai_log,
-                so_diem=delta,
-                mo_ta=f"{loai}: {ly}"
+                loai="Đổi điểm",
+                so_diem=-diem_tru if diem_tru > 0 else 0,
+                mo_ta=mo_ta,
             ))
+
+            # Cập nhật lượt dùng KM
+            from database.models import KhuyenMai
+            km_obj = s.get(KhuyenMai, d["id"])
+            if km_obj:
+                km_obj.so_luot_da_dung = (km_obj.so_luot_da_dung or 0) + 1
+
             s.commit()
+            QMessageBox.information(
+                self, "✅ Thành công",
+                f"Đã đổi {'<b>' + str(diem_tru) + '</b> điểm' if diem_tru > 0 else 'ưu đãi'} "
+                f"cho khách!\n\nƯu đãi: {ten}\n"
+                f"Điểm còn lại: {kh.diem_tich_luy:,}"
+            )
             self.accept()
         except Exception as e:
-            s.rollback()
-            QMessageBox.critical(self, "Lỗi", str(e))
+            s.rollback(); QMessageBox.critical(self, "Lỗi", str(e))
         finally:
             s.close()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# DIALOG PHÁT VOUCHER
+# DIALOG PHÁT VOUCHER — chỉ hiển thị KM loại Voucher Riêng (CaNhan)
 # ═══════════════════════════════════════════════════════════════════════════════
 class IssueVoucherDialog(QDialog):
+    """
+    Phát voucher riêng cho khách.
+    Chỉ hiển thị KM loại 'CaNhan' đang chạy.
+    Tạo từ KM → đồng bộ với hệ thống khuyến mãi.
+    """
     def __init__(self, kh_id: int, ten_kh: str, parent=None):
         super().__init__(parent)
-        self.kh_id = kh_id
-        self.setWindowTitle(f"Phát Voucher — {ten_kh}")
-        self.resize(400, 340); self.setStyleSheet(STYLE)
+        self.kh_id   = kh_id
+        self.ten_kh  = ten_kh
+        self._km_data: list = []
+        self._sel_km: dict | None = None
+
+        self.setWindowTitle(f"🎁 Phát Voucher — {ten_kh}")
+        self.resize(660, 520)
+        self.setStyleSheet(STYLE + """
+            QListWidget { background:#2D2D3F; border:1px solid #3E3E55;
+                border-radius:8px; color:white; font-size:13px; }
+            QListWidget::item { padding:10px 12px; border-bottom:1px solid #3E3E55; }
+            QListWidget::item:selected { background:#27AE60; color:white; }
+        """)
 
         root = QVBoxLayout(self)
-        root.setContentsMargins(24, 24, 24, 24); root.setSpacing(12)
+        root.setContentsMargins(20, 18, 20, 18); root.setSpacing(10)
 
-        form = QFormLayout(); form.setSpacing(10)
-        self.txt_ten = QLineEdit("Voucher tri ân")
-        self.cb_loai = QComboBox(); self.cb_loai.addItems(["TienMat", "PhanTram"])
-        self.sp_gt   = QDoubleSpinBox()
-        self.sp_gt.setRange(0, 10_000_000); self.sp_gt.setValue(50_000)
-        self.sp_max  = QDoubleSpinBox()
-        self.sp_max.setRange(0, 5_000_000); self.sp_max.setSpecialValueText("Không giới hạn")
-        self.sp_dk   = QDoubleSpinBox()
-        self.sp_dk.setRange(0, 10_000_000); self.sp_dk.setSpecialValueText("Không yêu cầu")
-        self.de_het  = QDateEdit(QDate.currentDate().addDays(30))
-        self.de_het.setCalendarPopup(True); self.de_het.setDisplayFormat("dd/MM/yyyy")
+        # ── Header ──────────────────────────────────────────────
+        hdr = QHBoxLayout()
+        hdr.addWidget(_lbl("🎁  PHÁT VOUCHER", "#8E44AD", 15, True))
+        hdr.addStretch()
+        hdr.addWidget(_lbl(f"Khách: {ten_kh}", "#A1A1AA", 12))
+        root.addLayout(hdr)
 
-        form.addRow(_fl("Tên voucher:"),       self.txt_ten)
-        form.addRow(_fl("Loại giảm:"),         self.cb_loai)
-        form.addRow(_fl("Giá trị giảm:"),      self.sp_gt)
-        form.addRow(_fl("Giảm tối đa (đ):"),   self.sp_max)
-        form.addRow(_fl("Đơn tối thiểu (đ):"), self.sp_dk)
-        form.addRow(_fl("Hết hạn:"),           self.de_het)
-        root.addLayout(form)
+        # ── Nội dung: Chọn Voucher Riêng ────────────────────────
+        from PySide6.QtWidgets import QSplitter
+        content_w = QWidget(); content_w.setStyleSheet("background:transparent;")
+        vkm = QVBoxLayout(content_w); vkm.setContentsMargins(0, 0, 0, 0); vkm.setSpacing(8)
 
-        btn = _btn("🎁  Phát Voucher", "#8E44AD", 44)
-        btn.clicked.connect(self._issue)
-        root.addWidget(btn)
+        vkm.addWidget(_lbl(
+            "Chọn voucher riêng để phát cho khách này.",
+            "#A1A1AA", 12
+        ))
+
+        # Splitter: trái = list KM | phải = preview
+        splitter = QSplitter(Qt.Horizontal)
+        splitter.setHandleWidth(2)
+        splitter.setStyleSheet("QSplitter::handle{background:#3E3E55;}")
+
+        left_w = QWidget(); left_w.setStyleSheet("background:transparent;")
+        lv = QVBoxLayout(left_w); lv.setContentsMargins(0,0,4,0); lv.setSpacing(6)
+        lv.addWidget(_lbl("Voucher Riêng đang chạy:", "#A1A1AA", 11))
+
+        from PySide6.QtWidgets import QListWidget, QListWidgetItem
+        self.lst_km = QListWidget()
+        self.lst_km.currentRowChanged.connect(self._on_km_row_changed)
+        lv.addWidget(self.lst_km)
+
+        # Hạn sử dụng voucher sẽ phát
+        het_row = QHBoxLayout()
+        het_row.addWidget(_lbl("Hạn sử dụng voucher:", "#A1A1AA", 11))
+        self.de_het_km = QDateEdit(QDate.currentDate().addDays(30))
+        self.de_het_km.setCalendarPopup(True)
+        self.de_het_km.setDisplayFormat("dd/MM/yyyy")
+        het_row.addWidget(self.de_het_km)
+        lv.addLayout(het_row)
+        splitter.addWidget(left_w)
+
+        right_w = QWidget(); right_w.setStyleSheet("background:transparent;")
+        rv = QVBoxLayout(right_w); rv.setContentsMargins(4,0,0,0); rv.setSpacing(8)
+        rv.addWidget(_lbl("👁  Xem trước:", "#A1A1AA", 11, True))
+        self.preview_km = QLabel()
+        self.preview_km.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+        self.preview_km.setWordWrap(True)
+        self.preview_km.setTextFormat(Qt.RichText)
+        self.preview_km.setStyleSheet(
+            "background:#1A1A2A;border-radius:10px;border:1px solid #3E3E55;"
+            "padding:16px;color:white;font-size:13px;"
+        )
+        self.preview_km.setMinimumHeight(180)
+        rv.addWidget(self.preview_km, stretch=1)
+        splitter.addWidget(right_w)
+        splitter.setSizes([300, 300])
+        vkm.addWidget(splitter, stretch=1)
+
+        root.addWidget(content_w, stretch=1)
+
+        # ── Nút ─────────────────────────────────────────────────
+        btn_row = QHBoxLayout(); btn_row.setSpacing(8)
+        btn_cancel = _btn("✖ Hủy", "#555577", 44)
+        btn_cancel.clicked.connect(self.reject)
+        self.btn_issue = _btn("🎁  Phát Voucher", "#27AE60", 44)
+        self.btn_issue.clicked.connect(self._issue)
+        btn_row.addWidget(btn_cancel)
+        btn_row.addStretch()
+        btn_row.addWidget(self.btn_issue)
+        root.addLayout(btn_row)
+
+        self._load_kms()
+
+    def _load_kms(self):
+        """Load KM loại 'CaNhan' đang chạy để phát voucher riêng."""
+        from database.models import KhuyenMai
+        from datetime import date as _date
+        s = get_session()
+        try:
+            today = _date.today()
+            kms = s.query(KhuyenMai).filter(
+                KhuyenMai.trang_thai == "Đang chạy"
+            ).all()
+            result = []
+            for km in kms:
+                nhom = getattr(km, 'loai_nhom', 'Chung') or 'Chung'
+                # Chỉ lấy CaNhan — bỏ Chung và DoiDiem
+                if nhom != 'CaNhan':
+                    continue
+                if km.ngay_bat_dau and km.ngay_bat_dau > today: continue
+                if km.ngay_ket_thuc and km.ngay_ket_thuc < today: continue
+                if km.loai_km == "MuaXTangY": continue
+                if km.kieu_giam == "PhanTram":
+                    uu_dai = f"Giảm {int(km.gia_tri_giam or 0)}%"
+                    if km.toi_da_giam:
+                        uu_dai += f" (tối đa {int(km.toi_da_giam):,}đ)"
+                else:
+                    uu_dai = f"Giảm {int(km.gia_tri_giam or 0):,}đ"
+                dk_min = float(km.dk_tong_tien_tu or 0)
+                result.append({
+                    "id":      km.id,
+                    "ten":     km.ten_km or "—",
+                    "mo_ta":   getattr(km, 'mo_ta', '') or "",
+                    "nhom":    nhom,
+                    "kieu":    km.kieu_giam or "TienMat",
+                    "gia_tri": float(km.gia_tri_giam or 0),
+                    "tran":    float(km.toi_da_giam or 0) if km.toi_da_giam else None,
+                    "dk_min":  dk_min,
+                    "uu_dai":  uu_dai,
+                    "het_km":  km.ngay_ket_thuc,
+                })
+            result.sort(key=lambda x: x["ten"])
+            self._km_data = result
+        finally:
+            s.close()
+
+        from PySide6.QtWidgets import QListWidgetItem
+        self.lst_km.clear()
+        if not result:
+            it = QListWidgetItem("— Chưa có Voucher Riêng nào đang chạy —")
+            it.setForeground(QColor("#A1A1AA"))
+            it.setFlags(Qt.ItemIsEnabled)
+            self.lst_km.addItem(it)
+            self.preview_km.setText(
+                "<div style='color:#7070A0;padding:30px;text-align:center;'>"
+                "Hãy tạo KM loại <b>Voucher Riêng</b> trong<br>"
+                "Quản lý Khuyến Mãi → chip <b>👤 Voucher Riêng</b> trước.</div>"
+            )
+            return
+        for d in result:
+            dk_str = f"  ·  Đơn ≥{int(d['dk_min']):,}đ" if d["dk_min"] else ""
+            it = QListWidgetItem(f"  👤  {d['ten']}  —  {d['uu_dai']}{dk_str}")
+            it.setForeground(QColor("#27AE60"))
+            it.setData(Qt.UserRole, d)
+            self.lst_km.addItem(it)
+        self.lst_km.setCurrentRow(0)
+
+    def _on_km_row_changed(self, row: int):
+        if row < 0 or row >= len(self._km_data):
+            self._sel_km = None
+            return
+        d = self._km_data[row]
+        self._sel_km = d
+
+        # Tự điền hạn = hạn KM hoặc 30 ngày
+        if d["het_km"]:
+            self.de_het_km.setDate(QDate(d["het_km"].year, d["het_km"].month, d["het_km"].day))
+
+        # Preview
+        mo_ta_html = (f"<p style='color:#A1A1AA;font-size:12px;margin:4px 0;'>{d['mo_ta']}</p>"
+                      if d["mo_ta"] else "")
+        if d["kieu"] == "PhanTram":
+            uu_html = f"<b style='color:#E74C3C;font-size:24px;'>{int(d['gia_tri'])}% OFF</b>"
+            if d["tran"]:
+                uu_html += f"<br><span style='color:#F39C12;font-size:12px;'>Tối đa {int(d['tran']):,}đ</span>"
+        else:
+            uu_html = f"<b style='color:#E74C3C;font-size:22px;'>−{int(d['gia_tri']):,}đ</b>"
+
+        dk_html = (
+            f"<div style='background:#1A1A2E;border-radius:6px;padding:8px 12px;margin:8px 0;"
+            f"font-size:12px;'>Đơn tối thiểu: <b>{int(d['dk_min']):,}đ</b></div>"
+            if d["dk_min"] else ""
+        )
+        code_preview = gen_code()
+        self.preview_km.setText(f"""
+        <div style='font-family:sans-serif;'>
+            <b style='font-size:14px;color:#E8E8F0;'>{d['ten']}</b><br>
+            {mo_ta_html}
+            <div style='text-align:center;padding:10px 0;'>{uu_html}</div>
+            {dk_html}
+            <div style='background:#2A1A3A;border-radius:6px;padding:8px 12px;font-size:12px;'>
+              Voucher sẽ tạo:<br>
+              Mã: <b style='color:#F1C40F;font-family:monospace;'>{code_preview}</b><br>
+              Khách: <b style='color:#A569BD;'>{self.ten_kh}</b>
+            </div>
+        </div>
+        """)
 
     def _issue(self):
-        qd  = self.de_het.date()
+        if not self._sel_km:
+            QMessageBox.warning(self, "Chưa chọn", "Hãy chọn một Voucher Riêng!"); return
+        d = self._sel_km
+        qd = self.de_het_km.date()
         het = date(qd.year(), qd.month(), qd.day())
         s = get_session()
         try:
             code = gen_code()
             v = Voucher(
-                ma_kh=self.kh_id, ma_code=code,
-                ten_voucher=self.txt_ten.text().strip() or "Voucher",
-                loai_giam=self.cb_loai.currentText(),
-                gia_tri_giam=self.sp_gt.value(),
-                toi_da_giam=self.sp_max.value() or None,
-                dieu_kien_toi_thieu=self.sp_dk.value(),
+                ma_kh=self.kh_id,
+                ma_code=code,
+                ten_voucher=d["ten"],
+                loai_giam=d["kieu"],
+                gia_tri_giam=d["gia_tri"],
+                toi_da_giam=d["tran"],
+                dieu_kien_toi_thieu=d["dk_min"] or 0,
                 ngay_het_han=het,
             )
+            try:
+                v.ma_km = d["id"]
+            except Exception:
+                pass
             s.add(v); s.commit()
-            QMessageBox.information(self, "Thành công", f"✅ Đã phát voucher!\nMã: {code}")
+            QMessageBox.information(
+                self, "✅ Thành công",
+                f"Đã phát voucher [{d['ten']}]!\n"
+                f"Mã: {code}\n"
+                f"Ưu đãi: {d['uu_dai']}\n"
+                f"Hạn dùng: {het.strftime('%d/%m/%Y')}"
+            )
             self.accept()
         except Exception as e:
             s.rollback(); QMessageBox.critical(self, "Lỗi", str(e))
@@ -432,7 +978,7 @@ class CustomerManagerDialog(QDialog):
         self.btn_add     = _btn("➕ Thêm",     "#27AE60")
         self.btn_edit    = _btn("✏️ Sửa",      "#2980B9")
         self.btn_add_pt  = _btn("⭐ Cộng điểm","#27AE60")
-        self.btn_deduct  = _btn("➖ Trừ điểm", "#E67E22")   # ← MỚI
+        self.btn_deduct  = _btn("🎁 Đổi điểm", "#E67E22")   # đổi điểm lấy KM
         self.btn_vc      = _btn("🎁 Voucher",  "#8E44AD")
         self.btn_hist    = _btn("📋 Lịch sử",  "#16A085")
         self.btn_del     = _btn("🗑 Xóa",      "#C0392B")
@@ -548,8 +1094,12 @@ class CustomerManagerDialog(QDialog):
     def _open_points(self, mode: str):
         kid = self._sel_id()
         if kid is None: return
-        if PointDialog(kid, self._sel_ten(), self._sel_diem(), mode, self).exec():
-            self._load_kh()
+        if mode == 'add':
+            if PointDialog(kid, self._sel_ten(), self._sel_diem(), self).exec():
+                self._load_kh()
+        else:
+            if RedeemDialog(kid, self._sel_ten(), self._sel_diem(), self).exec():
+                self._load_kh()
 
     def _issue_voucher(self):
         kid = self._sel_id()

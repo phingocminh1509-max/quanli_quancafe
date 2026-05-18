@@ -404,6 +404,7 @@ class POSWindow(QMainWindow):
 
         # Biến lưu khuyến mãi đang áp dụng
         self._applied_km  = None   # dict: {id, ten, loai, kieu, gia_tri, tran}
+        self._applied_voucher_id = None   # int id Voucher nếu áp dụng voucher
         self._km_discount = 0     # số tiền đã giảm thực tế
         self._linked_kh   = None  # dict: {id, ten, sdt, hang, diem}
         
@@ -1263,161 +1264,386 @@ class POSWindow(QMainWindow):
         except Exception:
             pass  # Lỗi auto-km không làm crash app
 
+    # ── Auto-migrate: thêm cột la_doi_diem + diem_can nếu chưa có ──────────
+    @staticmethod
+    def _migrate_km_cols():
+        try:
+            from database.db_config import get_session as _gs
+            import sqlalchemy as sa
+            s = _gs()
+            conn = s.get_bind().connect()
+            insp = sa.inspect(conn)
+            cols = {c["name"] for c in insp.get_columns("khuyen_mai")}
+            new_cols = {
+                "la_doi_diem": "INTEGER DEFAULT 0",
+                "diem_can":    "INTEGER DEFAULT 0",
+            }
+            for col, typ in new_cols.items():
+                if col not in cols:
+                    conn.execute(sa.text(f"ALTER TABLE khuyen_mai ADD COLUMN {col} {typ}"))
+            conn.commit(); conn.close(); s.close()
+        except Exception:
+            pass
+
     def _apply_khuyen_mai(self):
         """
-        Tự động tính KM tốt nhất đang chạy, cho phép xem/xác nhận/bỏ.
-        Không cần nhập mã tay.
+        Dialog 2 tab:
+          Tab 1 — KM Chung: hiển thị cho mọi KH, KHÔNG bao gồm KM đổi điểm.
+          Tab 2 — Voucher & Đổi Điểm:
+              - Voucher cá nhân: chỉ hiện khi có KH liên kết, thuộc về KH đó.
+              - KM đổi điểm (la_doi_diem=1): chỉ hiện khi có KH liên kết + đủ điểm.
         """
-        if not self.order_table.get_items():
+        if self.order_table.rowCount() == 0:
             QMessageBox.warning(self, "Hóa đơn trống", "Hãy thêm món trước!")
             return
 
+        self._migrate_km_cols()
+
         from database.db_config import get_session
-        from database.models import KhuyenMai
+        from database.models import KhuyenMai, Voucher
         from datetime import date
 
-        # Tính tổng đơn hiện tại
-        grand_total = self.order_table.grand_total()
-        subtotal    = grand_total * 1.10
+        grand_total = 0
+        for row in range(self.order_table.rowCount()):
+            item = self.order_table.item(row, 2)
+            if item and item.text().strip() and item.data(Qt.UserRole) != "note_row":
+                try: grand_total += float(item.text().replace(",", ""))
+                except ValueError: pass
+        subtotal = grand_total * 1.10
 
-        # Lấy danh sách KM hợp lệ
         session = get_session()
         try:
             today = date.today()
-            kms = session.query(KhuyenMai).filter_by(trang_thai="Đang chạy").all()
-            valid_kms = []
-            for km in kms:
-                if km.ngay_bat_dau and km.ngay_bat_dau > today: continue
-                if km.ngay_ket_thuc and km.ngay_ket_thuc < today: continue
-                if km.dk_tong_tien_tu and subtotal < km.dk_tong_tien_tu: continue
-                # Tính giảm tạm thời để chọn tốt nhất
+            kms   = session.query(KhuyenMai).filter_by(trang_thai="Đang chạy").all()
+
+            def _tinh_giam(km):
                 if km.kieu_giam == "PhanTram":
-                    giam = subtotal * float(km.gia_tri_giam or 0) / 100
-                    if km.toi_da_giam:
-                        giam = min(giam, float(km.toi_da_giam))
+                    g = subtotal * float(km.gia_tri_giam or 0) / 100
+                    if km.toi_da_giam: g = min(g, float(km.toi_da_giam))
+                    return g
                 elif km.kieu_giam == "TienMat":
-                    giam = min(float(km.gia_tri_giam or 0), subtotal)
-                else:
-                    giam = 0
-                valid_kms.append({
-                    "id":      km.id,
-                    "ten":     km.ten_km,
-                    "loai":    km.loai_km or "",
-                    "kieu":    km.kieu_giam or "",
+                    return min(float(km.gia_tri_giam or 0), subtotal)
+                return 0
+
+            def _base_ok(km):
+                if km.ngay_bat_dau and km.ngay_bat_dau > today: return False
+                if km.ngay_ket_thuc and km.ngay_ket_thuc < today: return False
+                if km.dk_tong_tien_tu and subtotal < km.dk_tong_tien_tu: return False
+                return True
+
+            kh_id   = self._linked_kh["id"]   if self._linked_kh else None
+            kh_diem = self._linked_kh["diem"] if self._linked_kh else 0
+
+            # ── Nhóm 1: KM Chung (la_doi_diem = 0 hoặc NULL) ─────────────
+            km_chung = []
+            for km in kms:
+                if not _base_ok(km): continue
+                if int(getattr(km, "la_doi_diem", 0) or 0): continue  # bỏ qua KM đổi điểm
+                g = _tinh_giam(km)
+                km_chung.append({
+                    "id": km.id, "ten": km.ten_km or "—",
+                    "loai": km.loai_km or "", "kieu": km.kieu_giam or "",
                     "gia_tri": float(km.gia_tri_giam or 0),
-                    "tran":    float(km.toi_da_giam or 0) or None,
-                    "dk_min":  float(km.dk_tong_tien_tu or 0),
-                    "_giam":   giam,
+                    "tran": float(km.toi_da_giam or 0) or None,
+                    "dk_min": float(km.dk_tong_tien_tu or 0),
+                    "diem_can": 0, "loai_nhom": "Chung", "_giam": g,
                 })
+            km_chung.sort(key=lambda x: -x["_giam"])
+
+            # ── Nhóm 2: KM Đổi Điểm (la_doi_diem = 1) + Voucher cá nhân ──
+            km_doi_diem = []
+            if kh_id:
+                for km in kms:
+                    if not _base_ok(km): continue
+                    if not int(getattr(km, "la_doi_diem", 0) or 0): continue
+                    diem_can = int(getattr(km, "diem_can", 0) or 0)
+                    # Chỉ hiện nếu đủ điểm
+                    if diem_can > 0 and kh_diem < diem_can: continue
+                    g = _tinh_giam(km)
+                    km_doi_diem.append({
+                        "id": km.id, "ten": km.ten_km or "—",
+                        "loai": km.loai_km or "", "kieu": km.kieu_giam or "",
+                        "gia_tri": float(km.gia_tri_giam or 0),
+                        "tran": float(km.toi_da_giam or 0) or None,
+                        "dk_min": float(km.dk_tong_tien_tu or 0),
+                        "diem_can": diem_can, "loai_nhom": "DoiDiem", "_giam": g,
+                    })
+                km_doi_diem.sort(key=lambda x: -x["_giam"])
+
+            # Voucher cá nhân của KH đang liên kết
+            vouchers = []
+            if kh_id:
+                vcs = (session.query(Voucher)
+                       .filter_by(ma_kh=kh_id, trang_thai="Chưa dùng").all())
+                for vc in vcs:
+                    if vc.ngay_het_han and vc.ngay_het_han < today: continue
+                    if vc.dieu_kien_toi_thieu and subtotal < vc.dieu_kien_toi_thieu: continue
+                    if vc.loai_giam == "PhanTram":
+                        g = subtotal * float(vc.gia_tri_giam or 0) / 100
+                        if vc.toi_da_giam: g = min(g, float(vc.toi_da_giam))
+                    else:
+                        g = min(float(vc.gia_tri_giam or 0), subtotal)
+                    vouchers.append({
+                        "id": vc.id, "ten": vc.ten_voucher or f"Voucher {vc.ma_code}",
+                        "ma_code": vc.ma_code,
+                        "loai": "Voucher", "kieu": vc.loai_giam or "TienMat",
+                        "gia_tri": float(vc.gia_tri_giam or 0),
+                        "tran": float(vc.toi_da_giam or 0) or None,
+                        "dk_min": float(vc.dieu_kien_toi_thieu or 0),
+                        "diem_can": 0, "loai_nhom": "Voucher", "_giam": g,
+                    })
+                vouchers.sort(key=lambda x: -x["_giam"])
+
         finally:
             session.close()
 
-        # Sắp xếp: KM giảm nhiều nhất lên đầu (auto-best)
-        valid_kms.sort(key=lambda x: x["_giam"], reverse=True)
+        # ── Dialog 2 tab ─────────────────────────────────────────
+        from PySide6.QtWidgets import (QTabWidget, QListWidget, QListWidgetItem,
+            QTableWidget, QTableWidgetItem, QHeaderView)
+        from PySide6.QtGui import QColor, QFont as _QFont
 
-        # ── Dialog chọn KM ───────────────────────────────────────
-        dlg = QDialog(self)
-        dlg.setWindowTitle("🎉 Khuyến Mãi")
-        dlg.resize(500, 420)
-        dlg.setStyleSheet(
-            "QDialog,QWidget{background:#1E1E2E;color:white;font-family:'Segoe UI';}"
+        DLG_STYLE = (
+            "QDialog,QWidget{background:#1E1E2E;color:white;}"
             "QLabel{background:transparent;}"
-            f"QListWidget{{background:#2D2D3F;border:none;border-radius:8px;"
-            f"color:white;font-size:13px;}}"
-            f"QListWidget::item{{padding:10px 14px;border-bottom:1px solid #3E3E55;}}"
-            f"QListWidget::item:selected{{background:#E67E22;color:white;}}"
-            f"QPushButton{{border-radius:6px;font-weight:bold;font-size:13px;color:white;padding:6px 14px;}}"
+            "QTabWidget::pane{border:none;background:#1E1E2E;}"
+            "QTabBar::tab{background:#252540;color:#8888AA;padding:9px 20px;"
+            "  border-radius:6px 6px 0 0;font-weight:bold;font-size:13px;}"
+            "QTabBar::tab:selected{background:#E67E22;color:white;}"
+            "QTableWidget{background:#1E2030;border:none;border-radius:8px;"
+            "  color:white;font-size:13px;}"
+            "QTableWidget::item{padding:8px 10px;border-bottom:1px solid #2D2D4A;}"
+            "QTableWidget::item:selected{background:#2C3E60;color:white;}"
+            "QHeaderView::section{background:#252540;color:#8888AA;padding:7px 10px;"
+            "  border:none;font-weight:bold;font-size:12px;}"
+            "QPushButton{border-radius:6px;font-weight:bold;font-size:13px;"
+            "  color:white;padding:8px 16px;border:none;}"
         )
-        dv = QVBoxLayout(dlg)
-        dv.setContentsMargins(18, 16, 18, 16)
-        dv.setSpacing(10)
 
-        # Tiêu đề + tổng đơn
+        dlg = QDialog(self)
+        dlg.setWindowTitle("🎉 Khuyến Mãi & Voucher")
+        dlg.resize(560, 500)
+        dlg.setStyleSheet(DLG_STYLE)
+        dv = QVBoxLayout(dlg)
+        dv.setContentsMargins(16, 14, 16, 14); dv.setSpacing(10)
+
+        # Header
         hdr = QHBoxLayout()
-        hdr_lbl = QLabel("<b style='color:#E67E22;font-size:15px;'>🎉  Chọn Khuyến Mãi</b>")
+        hdr_lbl = QLabel("<b style='color:#E67E22;font-size:15px;'>🎉  Chọn Khuyến Mãi / Voucher</b>")
         hdr_lbl.setTextFormat(Qt.RichText)
-        hdr.addWidget(hdr_lbl)
-        hdr.addStretch()
+        hdr.addWidget(hdr_lbl); hdr.addStretch()
         total_lbl = QLabel(f"<span style='color:#A1A1AA;font-size:12px;'>Đơn: {int(subtotal):,.0f} đ</span>")
         total_lbl.setTextFormat(Qt.RichText)
         hdr.addWidget(total_lbl)
         dv.addLayout(hdr)
 
-        if not valid_kms:
-            no_km = QLabel("😔  Không có khuyến mãi nào phù hợp với đơn này.")
-            no_km.setStyleSheet("color:#A1A1AA; font-size:13px; padding:20px 0;")
-            no_km.setAlignment(Qt.AlignCenter)
-            dv.addWidget(no_km)
-            btn_close = QPushButton("Đóng")
-            btn_close.setMinimumHeight(38)
-            btn_close.setStyleSheet("background:#555566;color:white;font-weight:bold;border-radius:6px;")
-            btn_close.clicked.connect(dlg.reject)
-            dv.addWidget(btn_close)
-            dlg.exec()
-            return
+        # ── Helper tạo bảng KM ────────────────────────────────────
+        def _make_km_table(data_list, show_diem=False):
+            cols = ["Ưu đãi", "Tiết kiệm"]
+            if show_diem: cols = ["Ưu đãi", "Cần điểm", "Tiết kiệm"]
+            tbl = QTableWidget(0, len(cols))
+            tbl.setHorizontalHeaderLabels(cols)
+            tbl.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+            for c in range(1, len(cols)):
+                tbl.horizontalHeader().setSectionResizeMode(c, QHeaderView.ResizeToContents)
+            tbl.verticalHeader().setVisible(False)
+            tbl.setSelectionBehavior(QAbstractItemView.SelectRows)
+            tbl.setSelectionMode(QAbstractItemView.SingleSelection)
+            tbl.setEditTriggers(QAbstractItemView.NoEditTriggers)
+            tbl.setShowGrid(False)
 
-        # Gợi ý KM tốt nhất
-        best = valid_kms[0]
-        tip = QLabel(
-            f"✨  <b>Tốt nhất:</b>  {best['ten']}  —  giảm <b style='color:#E67E22;'>"
-            f"{int(best['_giam']):,}đ</b>"
+            row_data = []
+            for d in data_list:
+                if d["kieu"] == "PhanTram":
+                    uu = f"Giảm {int(d['gia_tri'])}%"
+                    if d["tran"]: uu += f" (tối đa {int(d['tran']):,}đ)"
+                elif d["kieu"] == "TienMat":
+                    uu = f"Giảm {int(d['gia_tri']):,}đ"
+                elif d["loai"] == "MuaXTangY":
+                    uu = "Mua X Tặng Y"
+                else:
+                    uu = d["loai"] or "—"
+                dk = f"  ·  Đơn ≥{int(d['dk_min']):,}đ" if d.get("dk_min") else ""
+                sv = f"-{int(d['_giam']):,}đ" if d.get("_giam") else "—"
+
+                r = tbl.rowCount(); tbl.insertRow(r); tbl.setRowHeight(r, 42)
+                it0 = QTableWidgetItem(f"  {d['ten']}  ·  {uu}{dk}")
+                it0.setForeground(QColor("#E8E8F0")); it0.setData(Qt.UserRole, d)
+                tbl.setItem(r, 0, it0)
+
+                if show_diem:
+                    dc = d.get("diem_can", 0)
+                    it_d = QTableWidgetItem(f"🔢 {dc:,}" if dc else "Không cần")
+                    it_d.setTextAlignment(Qt.AlignCenter | Qt.AlignVCenter)
+                    it_d.setForeground(QColor("#F1C40F") if dc else QColor("#2ECC71"))
+                    tbl.setItem(r, 1, it_d)
+                    col_sv = 2
+                else:
+                    col_sv = 1
+
+                it_sv = QTableWidgetItem(sv)
+                it_sv.setTextAlignment(Qt.AlignCenter | Qt.AlignVCenter)
+                it_sv.setForeground(QColor("#2ECC71") if d.get("_giam") else QColor("#666677"))
+                f2 = _QFont("Segoe UI", 13, _QFont.Bold); it_sv.setFont(f2)
+                tbl.setItem(r, col_sv, it_sv)
+                row_data.append(d)
+
+            if row_data: tbl.selectRow(0)
+            return tbl, row_data
+
+        # ── Tab 1: KM Chung (mọi KH) ─────────────────────────────
+        tab_chung = QWidget(); tab_chung.setStyleSheet("background:transparent;")
+        tc = QVBoxLayout(tab_chung); tc.setContentsMargins(0,8,0,0); tc.setSpacing(8)
+
+        if km_chung:
+            best = km_chung[0]
+            tip = QLabel(
+                f"✨ <b>Tốt nhất:</b> {best['ten']}  —  "
+                f"giảm <b style='color:#E67E22;'>{int(best['_giam']):,}đ</b>"
+            )
+            tip.setTextFormat(Qt.RichText)
+            tip.setStyleSheet(
+                "background:#2D3A2D;border:1px solid #27AE60;border-radius:6px;"
+                "padding:7px 12px;font-size:12px;color:#A9DFBF;"
+            )
+            tc.addWidget(tip)
+            tbl_chung, chung_data = _make_km_table(km_chung)
+            tc.addWidget(tbl_chung)
+        else:
+            lbl_no = QLabel("😔  Không có khuyến mãi nào phù hợp với đơn này.")
+            lbl_no.setStyleSheet("color:#A1A1AA;font-size:13px;padding:20px 0;")
+            lbl_no.setAlignment(Qt.AlignCenter)
+            tc.addWidget(lbl_no)
+            tbl_chung, chung_data = None, []
+
+        # ── Tab 2: Voucher & Đổi Điểm (chỉ khi có KH liên kết) ──
+        tab_ca_nhan = QWidget(); tab_ca_nhan.setStyleSheet("background:transparent;")
+        tca = QVBoxLayout(tab_ca_nhan); tca.setContentsMargins(0,8,0,0); tca.setSpacing(8)
+
+        tbl_vc, vc_data = None, []
+        tbl_dd, dd_data = None, []
+
+        if not kh_id:
+            lbl_login = QLabel(
+                "🔒  Vui lòng <b>liên kết số điện thoại khách hàng</b>\n"
+                "để xem voucher cá nhân và ưu đãi đổi điểm."
+            )
+            lbl_login.setTextFormat(Qt.RichText)
+            lbl_login.setWordWrap(True)
+            lbl_login.setAlignment(Qt.AlignCenter)
+            lbl_login.setStyleSheet(
+                "background:#2A1F1A;border:1px solid #E67E22;border-radius:8px;"
+                "color:#E67E22;padding:24px;font-size:13px;"
+            )
+            tca.addWidget(lbl_login)
+        else:
+            kh_info = QLabel(
+                f"👤 <b>{self._linked_kh['ten']}</b>"
+                f"  |  SĐT: {self._linked_kh['sdt']}"
+                f"  |  🌟 Điểm: <b style='color:#F1C40F;'>{kh_diem:,}</b>"
+            )
+            kh_info.setTextFormat(Qt.RichText)
+            kh_info.setStyleSheet(
+                "background:#1A2A1A;border:1px solid #27AE60;border-radius:6px;"
+                "padding:8px 12px;font-size:12px;color:#A9DFBF;"
+            )
+            tca.addWidget(kh_info)
+
+            if vouchers:
+                tca.addWidget(QLabel("<b style='color:#3498DB;'>🎟 Voucher cá nhân:</b>"))
+                tbl_vc, vc_data = _make_km_table(vouchers)
+                tbl_vc.setMaximumHeight(160)
+                tca.addWidget(tbl_vc)
+
+            if km_doi_diem:
+                tca.addWidget(QLabel(
+                    f"<b style='color:#E67E22;'>🔢 Đổi điểm (bạn có {kh_diem:,} điểm):</b>"
+                ))
+                tbl_dd, dd_data = _make_km_table(km_doi_diem, show_diem=True)
+                tca.addWidget(tbl_dd)
+            elif not vouchers:
+                lbl_no2 = QLabel("Chưa có voucher hoặc KM đổi điểm nào khả dụng.")
+                lbl_no2.setStyleSheet("color:#7070A0;font-size:13px;padding:12px 0;")
+                lbl_no2.setAlignment(Qt.AlignCenter)
+                tca.addWidget(lbl_no2)
+
+        # ── Tab widget ────────────────────────────────────────────
+        from PySide6.QtWidgets import QTabWidget
+        tab_widget = QTabWidget()
+        tab_widget.addTab(tab_chung,   "🌐  KM Chung")
+        tab_widget.addTab(tab_ca_nhan,
+            "👤  Voucher & Điểm" + (f" ({len(vouchers)+len(km_doi_diem)})" if kh_id and (vouchers or km_doi_diem) else "")
         )
-        tip.setTextFormat(Qt.RichText)
-        tip.setStyleSheet(
-            "background:#2D3A2D; border:1px solid #27AE60; border-radius:6px;"
-            " padding:7px 12px; font-size:12px; color:#A9DFBF;"
-        )
-        dv.addWidget(tip)
+        # Nếu không có KH: disable tab cá nhân tooltip
+        if not kh_id:
+            tab_widget.setTabToolTip(1, "Cần liên kết SĐT khách hàng")
+        dv.addWidget(tab_widget, stretch=1)
 
-        from PySide6.QtWidgets import QListWidget, QListWidgetItem
-        lst = QListWidget()
-        for km in valid_kms:
-            if km["kieu"] == "PhanTram":
-                desc = f"Giảm {int(km['gia_tri'])}%"
-                if km["tran"]:
-                    desc += f"  (tối đa {int(km['tran']):,}đ)"
-            elif km["kieu"] == "TienMat":
-                desc = f"Giảm {int(km['gia_tri']):,}đ"
-            else:
-                desc = km["loai"]
-            if km["dk_min"]:
-                desc += f"  |  Đơn từ {int(km['dk_min']):,}đ"
-            saving_str = f"  →  -{int(km['_giam']):,}đ" if km["_giam"] else ""
-            it = QListWidgetItem(f"  🎉  {km['ten']}  —  {desc}{saving_str}")
-            it.setData(Qt.UserRole, km)
-            lst.addItem(it)
-        lst.setCurrentRow(0)   # Tự động chọn KM tốt nhất
-        dv.addWidget(lst)
-
-        btn_row = QHBoxLayout()
-        btn_row.setSpacing(8)
-
-        btn_ok = QPushButton("✅  Áp dụng")
-        btn_ok.setMinimumHeight(40)
-        btn_ok.setStyleSheet("background:#27AE60;color:white;font-weight:bold;border-radius:6px;")
-
-        btn_remove = QPushButton("🗑  Bỏ KM")
-        btn_remove.setMinimumHeight(40)
-        btn_remove.setStyleSheet("background:#C0392B;color:white;font-weight:bold;border-radius:6px;")
-
-        btn_cancel = QPushButton("Hủy")
-        btn_cancel.setMinimumHeight(40)
-        btn_cancel.setStyleSheet("background:#555566;color:white;font-weight:bold;border-radius:6px;")
-
-        btn_row.addWidget(btn_ok)
-        btn_row.addWidget(btn_remove)
+        # ── Nút hành động ─────────────────────────────────────────
+        btn_row = QHBoxLayout(); btn_row.setSpacing(10)
+        btn_cancel = QPushButton("✖ Hủy")
+        btn_cancel.setStyleSheet("background:#555566;")
+        btn_remove = QPushButton("❌ Bỏ KM / Voucher")
+        btn_remove.setStyleSheet("background:#C0392B;")
+        btn_ok = QPushButton("✅ Áp dụng")
+        btn_ok.setStyleSheet("background:#27AE60;font-size:14px;padding:10px 20px;")
+        btn_ok.setMinimumHeight(44)
         btn_row.addWidget(btn_cancel)
+        btn_row.addWidget(btn_remove)
+        btn_row.addStretch()
+        btn_row.addWidget(btn_ok)
         dv.addLayout(btn_row)
 
+        # ── Logic áp dụng ─────────────────────────────────────────
+        def _get_selected():
+            """Trả về km_data đang được chọn theo tab active."""
+            tab = tab_widget.currentIndex()
+            if tab == 0:
+                if tbl_chung and tbl_chung.currentRow() >= 0:
+                    return chung_data[tbl_chung.currentRow()] if chung_data else None
+            else:
+                # Ưu tiên bảng nào đang có row selected
+                if tbl_vc and tbl_vc.currentRow() >= 0 and tbl_vc.hasFocus():
+                    return vc_data[tbl_vc.currentRow()]
+                if tbl_dd and tbl_dd.currentRow() >= 0:
+                    return dd_data[tbl_dd.currentRow()]
+                if tbl_vc and tbl_vc.currentRow() >= 0:
+                    return vc_data[tbl_vc.currentRow()]
+            return None
+
         def _do_apply():
-            sel = lst.currentItem()
+            sel = _get_selected()
             if not sel:
-                QMessageBox.warning(dlg, "Chưa chọn", "Hãy chọn một khuyến mãi!"); return
-            km_data = sel.data(Qt.UserRole)
-            self._applied_km = km_data
+                QMessageBox.warning(dlg, "Chưa chọn", "Hãy chọn một khuyến mãi hoặc voucher!")
+                return
+
+            # Kiểm tra KM đổi điểm: cần đủ điểm + KH liên kết
+            if sel.get("loai_nhom") == "DoiDiem":
+                diem_can = sel.get("diem_can", 0)
+                if not kh_id:
+                    QMessageBox.warning(dlg, "Cần KH liên kết",
+                        "KM đổi điểm yêu cầu liên kết số điện thoại khách hàng!")
+                    return
+                if diem_can > 0 and kh_diem < diem_can:
+                    QMessageBox.warning(dlg, "Không đủ điểm",
+                        f"Khách có {kh_diem:,} điểm, cần {diem_can:,} điểm!")
+                    return
+
+            # Kiểm tra Voucher: phải đúng KH
+            if sel.get("loai_nhom") == "Voucher" and not kh_id:
+                QMessageBox.warning(dlg, "Cần KH liên kết",
+                    "Voucher cá nhân yêu cầu liên kết số điện thoại khách hàng!")
+                return
+
+            self._applied_km = sel
+            self._km_user_picked = True
+            # Đánh dấu voucher nếu là Voucher
+            self._applied_voucher_id = sel["id"] if sel.get("loai_nhom") == "Voucher" else None
             self.update_grand_total()
-            _log(self.user.id, "Áp dụng khuyến mãi",
-                 f"Áp KM '{km_data['ten']}' — giảm {int(self._km_discount):,}đ",
+
+            nhom = sel.get("loai_nhom", "Chung")
+            _log(self.user.id,
+                 "Áp dụng KM/Voucher",
+                 f"[{nhom}] {sel['ten']} — giảm {int(self._km_discount):,}đ",
                  o_dau="POS - Thanh toán")
             dlg.accept()
 
@@ -1425,14 +1651,18 @@ class POSWindow(QMainWindow):
             old = self._applied_km["ten"] if self._applied_km else "—"
             self._applied_km = None
             self._km_discount = 0
+            self._km_user_picked = False
+            self._applied_voucher_id = None
             self.update_grand_total()
-            _log(self.user.id, "Bỏ khuyến mãi", f"Gỡ KM '{old}'", o_dau="POS - Thanh toán")
+            _log(self.user.id, "Bỏ KM/Voucher", f"Gỡ '{old}' khỏi hóa đơn",
+                 o_dau="POS - Thanh toán")
             dlg.accept()
 
         btn_ok.clicked.connect(_do_apply)
         btn_remove.clicked.connect(_do_remove)
         btn_cancel.clicked.connect(dlg.reject)
         dlg.exec()
+
 
     # ----------------------------------------------------------------
     # ĐIỂM THÀNH VIÊN
@@ -1460,14 +1690,15 @@ class POSWindow(QMainWindow):
 
     def _open_loyalty(self):
         """
-        Popup nhập SĐT để tìm / tạo khách thành viên và liên kết bill.
+        Popup nhập SĐT để tìm / tạo khách thành viên, liên kết bill,
+        hoặc đổi điểm lấy khuyến mãi (không bắt buộc phải liên kết bill trước).
         """
         from database.db_config import get_session
         from database.models import KhachHang
 
         dlg = QDialog(self)
         dlg.setWindowTitle("⭐ Điểm Thành Viên")
-        dlg.resize(420, 320)
+        dlg.resize(460, 300)
         dlg.setStyleSheet(
             "QDialog,QWidget{background:#1E1E2E;color:white;font-family:'Segoe UI';}"
             "QLabel{background:transparent;}"
@@ -1503,7 +1734,7 @@ class POSWindow(QMainWindow):
         )
         dv.addWidget(lbl_result)
 
-        # Hàng nút
+        # Hàng nút 1: Tìm + Liên kết + Bỏ liên kết + Đóng
         btn_row = QHBoxLayout()
         btn_row.setSpacing(8)
         btn_search = QPushButton("🔍  Tìm")
@@ -1513,9 +1744,6 @@ class POSWindow(QMainWindow):
         btn_link.setEnabled(False)
         btn_unlink = QPushButton("🗑  Bỏ liên kết")
         btn_unlink.setStyleSheet("background:#C0392B;color:white;font-weight:bold;border-radius:6px;")
-        btn_new    = QPushButton("➕  Thêm TV mới")
-        btn_new.setStyleSheet("background:#2980B9;color:white;font-weight:bold;border-radius:6px;")
-        btn_new.setVisible(False)
         btn_close  = QPushButton("Đóng")
         btn_close.setStyleSheet("background:#555566;color:white;font-weight:bold;border-radius:6px;")
 
@@ -1524,7 +1752,10 @@ class POSWindow(QMainWindow):
         btn_row.addWidget(btn_unlink)
         btn_row.addWidget(btn_close)
         dv.addLayout(btn_row)
-        dv.addWidget(btn_new)
+
+        btn_new = QPushButton("➕  Thêm TV mới")
+        btn_new.setStyleSheet("background:#2980B9;color:white;font-weight:bold;border-radius:6px;")
+        btn_new.setVisible(False)
 
         # Nếu đang có KH liên kết → điền sẵn SĐT
         if self._linked_kh:
@@ -1594,8 +1825,6 @@ class POSWindow(QMainWindow):
             from views.customer_manager import CustomerManagerDialog
             cm = CustomerManagerDialog(self)
             cm.exec()
-            # Điền lại SĐT vừa nhập nếu user muốn tìm lại
-            dlg2 = QDialog(self)   # không cần mở lại dlg cũ vì đã reject
 
         txt_sdt.returnPressed.connect(_do_search)
         btn_search.clicked.connect(_do_search)
@@ -1993,9 +2222,28 @@ class POSWindow(QMainWindow):
                 order_items, self.user.id,
                 km_id=self._applied_km["id"] if self._applied_km else None,
                 km_discount=int(self._km_discount),
+                khach_hang_id=self._linked_kh["id"] if self._linked_kh else None,
             )
             if success:
                 self.sound_cash.play()
+
+                # ── Đánh dấu voucher đã dùng (nếu áp voucher) ──────────
+                vc_id = getattr(self, '_applied_voucher_id', None)
+                if vc_id:
+                    try:
+                        from database.db_config import get_session as _gs
+                        from database.models import Voucher as _VC
+                        _s = _gs()
+                        try:
+                            vc = _s.query(_VC).filter_by(id=vc_id).first()
+                            if vc:
+                                vc.trang_thai = "Đã dùng"
+                                _s.commit()
+                        finally:
+                            _s.close()
+                    except Exception:
+                        pass
+                self._applied_voucher_id = None
 
                 # Tóm tắt đơn để ghi log
                 mon_list = ", ".join(
@@ -2053,7 +2301,9 @@ class POSWindow(QMainWindow):
         _log(self.user.id, "Mở Quản lý KM", o_dau="Khuyến mãi")
         from views.khuyen_mai_manager import KhuyenMaiManagerDialog
         KhuyenMaiManagerDialog(self).exec()
-
+    def show_voucher_manager(self):
+        from views.voucher_manager import VoucherManagerDialog
+        VoucherManagerDialog(self, ma_nv=self.user.id).exec()
     def show_report(self):
         _log(self.user.id, "Mở Báo cáo", o_dau="Báo cáo")
         try:

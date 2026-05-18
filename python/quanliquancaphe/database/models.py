@@ -213,6 +213,17 @@ class KhuyenMai(Base):
     trang_thai      = Column(String(50), default='Đang chạy')
     # 'Đang chạy' | 'Tạm dừng' | 'Hết hạn'
 
+    # ── Cột mở rộng (migrate tự động) ─────────────────────────
+    mo_ta           = Column(String(500), nullable=True)
+    danh_muc        = Column(String(200), nullable=True)
+    gio_tu          = Column(Time,        nullable=True)  # Happy Hour bắt đầu
+    gio_den         = Column(Time,        nullable=True)  # Happy Hour kết thúc
+    uu_tien         = Column(Integer,     default=0)      # thứ tự ưu tiên
+    loai_nhom       = Column(String(20),  default='Chung')
+    # 'Chung' = áp cho tất cả | 'DoiDiem' = đổi điểm | 'CaNhan' = voucher riêng
+    diem_can        = Column(Integer,     default=0)      # điểm cần để đổi
+    la_doi_diem     = Column(Integer,     default=0)      # 1 nếu là KM đổi điểm
+
     san_pham      = relationship("SanPham", foreign_keys=[ma_sp])
     san_pham_tang = relationship("SanPham", foreign_keys=[ma_sp_tang])
 

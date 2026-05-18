@@ -27,8 +27,9 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, QDate, QTimer, Signal, QThread
 from PySide6.QtGui import QColor, QFont
 
+from sqlalchemy.orm import joinedload
 from database.db_config import get_session
-from database.models import HoaDon, ChiTietHoaDon, NhanVien, KhuyenMai
+from database.models import HoaDon, ChiTietHoaDon, NhanVien, KhuyenMai, PhienLamViec
 
 PAGE_SIZE = 30   # số hóa đơn mỗi trang
 
@@ -356,6 +357,10 @@ class HistoryDialog(QDialog):
         dt_to   = datetime(d_to.year,   d_to.month,   d_to.day,   23, 59, 59)
 
         q = (session.query(HoaDon)
+             .options(
+                 joinedload(HoaDon.khach_hang),
+                 joinedload(HoaDon.phien_lam_viec).joinedload(PhienLamViec.nhan_vien),
+             )
              .filter(HoaDon.thoi_gian >= dt_from, HoaDon.thoi_gian <= dt_to))
 
         tt = self.cb_tt.currentText()
@@ -364,7 +369,6 @@ class HistoryDialog(QDialog):
 
         nv_id = self.cb_nv.currentData()
         if nv_id:
-            from database.models import PhienLamViec
             q = q.join(PhienLamViec, HoaDon.ma_phien == PhienLamViec.id)\
                  .filter(PhienLamViec.ma_nv == nv_id)
 
@@ -570,6 +574,7 @@ class _DetailPanel(QFrame):
             ("Thời gian","thoi_gian"),
             ("Thu ngân", "nhan_vien"),
             ("Khách",    "khach_hang"),
+            ("SĐT",      "so_dien_thoai"),
             ("PTTT",     "pttt"),
             ("KM",       "km"),
             ("Thuế",     "thue"),
@@ -629,10 +634,11 @@ class _DetailPanel(QFrame):
                 nv_ten = hd.phien_lam_viec.nhan_vien.ten_nv
 
             kh_ten = "—"
+            kh_sdt = "—"
             if hd.khach_hang:
-                kh_ten = f"{hd.khach_hang.ten_kh}"
+                kh_ten = hd.khach_hang.ten_kh
                 if hd.khach_hang.so_dien_thoai:
-                    kh_ten += f"\n📱 {hd.khach_hang.so_dien_thoai}"
+                    kh_sdt = f"📱 {hd.khach_hang.so_dien_thoai}"
 
             km_ten = "—"
             if hd.khuyen_mai:
@@ -654,6 +660,7 @@ class _DetailPanel(QFrame):
                               if hd.thoi_gian else "—")
             _set("nhan_vien", nv_ten)
             _set("khach_hang",kh_ten)
+            _set("so_dien_thoai", kh_sdt, C_MUTED)
             _set("pttt",      f"{_pttt_icon(hd.phuong_thuc_tt)} {hd.phuong_thuc_tt or '—'}")
             _set("km",        km_ten, C_ORANGE)
             _set("thue",      f"+{int(hd.thue or 0):,} đ", C_RED)

@@ -26,10 +26,11 @@ def process_checkout(
     """
     Tạo HoaDon + ChiTietHoaDon từ danh sách món đã order.
 
-    order_items : list of dict {'name': str, 'qty': int, 'price': float, 'note': str}
-    nhan_vien_id: id của NhanVien đang đăng nhập
-    km_id       : id KhuyenMai áp dụng (None = không có)
-    km_discount : số tiền được giảm (đã tính sẵn từ UI)
+    order_items   : list of dict {'name', 'qty', 'price', 'note'}
+    nhan_vien_id  : id NhanVien đang đăng nhập
+    km_id         : id KhuyenMai áp dụng (None = không có)
+    km_discount   : số tiền được giảm (đã tính sẵn từ UI)
+    khach_hang_id : id KhachHang liên kết (None = khách vãng lai)
     """
     session = get_session()
     try:
@@ -41,10 +42,10 @@ def process_checkout(
             session.flush()
 
         # 2. Tính tiền
-        grand_total  = sum(item['qty'] * item['price'] for item in order_items)
-        vat          = grand_total * 0.10
-        subtotal     = grand_total + vat
-        thanh_tien   = max(0.0, subtotal - float(km_discount))
+        grand_total = sum(item['qty'] * item['price'] for item in order_items)
+        vat         = grand_total * 0.10
+        subtotal    = grand_total + vat
+        thanh_tien  = max(0.0, subtotal - float(km_discount))
 
         # 3. Tạo hóa đơn
         hoa_don = HoaDon(
@@ -65,7 +66,6 @@ def process_checkout(
             sp = session.query(SanPham).filter_by(ten_sp=item['name']).first()
             if not sp:
                 raise ValueError(f"Không tìm thấy sản phẩm: {item['name']}")
-
             ct = ChiTietHoaDon(
                 ma_hd      = hoa_don.id,
                 ma_sp      = sp.id,
@@ -84,7 +84,18 @@ def process_checkout(
                 km.so_luot_da_dung = (km.so_luot_da_dung or 0) + 1
 
         session.commit()
-        return True, f"Hóa đơn HD{hoa_don.id:04d} | Tổng: {int(thanh_tien):,} đ"
+
+        # 6. Tích điểm cho khách hàng (sau commit để HoaDon đã tồn tại trong DB)
+        _diem_msg = ""
+        if khach_hang_id:
+            try:
+                from controllers.loyalty_controller import tich_diem_hoa_don
+                _ok, _diem_msg = tich_diem_hoa_don(hoa_don.id)
+            except Exception:
+                pass
+
+        _suffix = f" | {_diem_msg}" if _diem_msg else ""
+        return True, f"Hóa đơn HD{hoa_don.id:04d} | Tổng: {int(thanh_tien):,} đ{_suffix}"
 
     except Exception as e:
         session.rollback()

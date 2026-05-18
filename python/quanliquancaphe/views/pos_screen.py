@@ -150,15 +150,17 @@ class DiscountDialog(QDialog):
         s = get_session()
         try:
             kms = (s.query(KhuyenMai)
-                   .filter(KhuyenMai.trang_thai == True)
                    .order_by(KhuyenMai.id.desc()).all())
             for km in kms:
-                if km.ngay_het_han and km.ngay_het_han < today:
+                # use model helper to check basic validity (status, dates, uses)
+                try:
+                    if not km.con_hieu_luc(today):
+                        continue
+                except Exception:
+                    # fallback: skip invalid/old entries
                     continue
-                if km.so_luot_toi_da and (km.so_luot_da_dung or 0) >= km.so_luot_toi_da:
-                    continue
-                suffix = "%" if km.loai_giam == "PhanTram" else "đ"
-                label  = f"{km.ten_km}  ({int(km.gia_tri_giam)}{suffix})"
+                suffix = "%" if getattr(km, 'kieu_giam', '') == "PhanTram" else "đ"
+                label = f"{km.ten_km}  ({int(getattr(km, 'gia_tri_giam', 0))}{suffix})"
                 self.cb_km.addItem(label, km.id)
                 self._km_list.append(km)
         finally:
@@ -191,12 +193,19 @@ class DiscountDialog(QDialog):
             return 0.0
         for km in self._km_list:
             if km.id == km_id:
-                if km.loai_giam == "PhanTram":
-                    d = self.grand_total * float(km.gia_tri_giam) / 100
-                    if km.giam_toi_da:
-                        d = min(d, float(km.giam_toi_da))
+                kieu = getattr(km, 'kieu_giam', '')
+                val  = float(getattr(km, 'gia_tri_giam', 0) or 0)
+                if kieu == "PhanTram":
+                    d = self.grand_total * val / 100.0
+                    cap = getattr(km, 'toi_da_giam', None)
+                    if cap:
+                        try:
+                            d = min(d, float(cap))
+                        except Exception:
+                            pass
                     return d
-                return min(float(km.gia_tri_giam), self.grand_total)
+                # fixed amount
+                return min(val, self.grand_total)
         return 0.0
 
     def _preview(self):
