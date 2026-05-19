@@ -126,15 +126,33 @@ def _lbl(text: str, color: str = TEXT, size: int = 13, bold: bool = False) -> QL
 # DIALOG: ÁP DỤNG KHUYẾN MÃI  (tích hợp, không import ngoài)
 # ══════════════════════════════════════════════════════════════════════════════
 class DiscountDialog(QDialog):
-    def __init__(self, grand_total: float, parent=None):
+    """
+    Dialog áp dụng khuyến mãi — hỗ trợ đầy đủ loại MuaXTangY:
+      • Tự đọc hóa đơn hiện tại (invoice_items) để đếm số lượng sp X
+      • So khớp tên món trong hóa đơn với sp_mua lưu trong DB (ma_sp)
+      • Nếu đủ X → tính ra số lượng quà Y (hỗ trợ nhiều bộ)
+      • Preview real-time: ✅ đủ / ⚠️ thiếu bao nhiêu
+      • Kết quả trả về:
+          - KM tiền: result_discount > 0, result_gift = None
+          - KM MuaXTangY: result_gift = {"name": tên_sp_tang, "qty": so_luong}
+    """
+
+    def __init__(self, grand_total: float, invoice_items: list[dict], parent=None):
         super().__init__(parent)
-        self.grand_total     = grand_total
+        self.grand_total   = grand_total
+        # Chỉ lấy các dòng thường, bỏ quà tặng cũ khỏi kiểm tra điều kiện
+        self.invoice_items = [it for it in invoice_items if not it.get("is_gift")]
         self.result_km_id    = None
         self.result_discount = 0.0
+        self.result_gift     = None   # {"name": str, "qty": int} nếu MuaXTangY
         self._km_list: list  = []
 
+        # Cache tên sp từ DB (ma_sp → ten_sp)
+        self._sp_cache: dict[int, str] = {}
+        self._load_sp_cache()
+
         self.setWindowTitle("🎉  Áp Dụng Khuyến Mãi")
-        self.resize(440, 280)
+        self.resize(460, 320)
         self.setStyleSheet(STYLE_DLG)
 
         root = QVBoxLayout(self)
@@ -149,18 +167,28 @@ class DiscountDialog(QDialog):
         today = date.today()
         s = get_session()
         try:
-            kms = (s.query(KhuyenMai)
-                   .order_by(KhuyenMai.id.desc()).all())
+            kms = (s.query(KhuyenMai).order_by(KhuyenMai.id.desc()).all())
             for km in kms:
-                # use model helper to check basic validity (status, dates, uses)
+                nhom = getattr(km, 'loai_nhom', 'Chung') or 'Chung'
+                if nhom in ('DoiDiem', 'CaNhan'):
+                    continue
                 try:
                     if not km.con_hieu_luc(today):
                         continue
                 except Exception:
-                    # fallback: skip invalid/old entries
                     continue
-                suffix = "%" if getattr(km, 'kieu_giam', '') == "PhanTram" else "đ"
-                label = f"{km.ten_km}  ({int(getattr(km, 'gia_tri_giam', 0))}{suffix})"
+
+                loai = getattr(km, 'loai_km', '') or ''
+                if loai == "MuaXTangY":
+                    ten_x = self._sp_cache.get(km.ma_sp, f"SP#{km.ma_sp}") if km.ma_sp else "?"
+                    ten_y = self._sp_cache.get(km.ma_sp_tang, f"SP#{km.ma_sp_tang}") if km.ma_sp_tang else "?"
+                    sl_x  = km.so_luong_mua or 1
+                    sl_y  = km.so_luong_tang or 1
+                    label = f"🎁 {km.ten_km}  (Mua {sl_x}×{ten_x} → Tặng {sl_y}×{ten_y})"
+                else:
+                    suffix = "%" if getattr(km, 'kieu_giam', '') == "PhanTram" else "đ"
+                    label  = f"{km.ten_km}  ({int(getattr(km, 'gia_tri_giam', 0))}{suffix})"
+
                 self.cb_km.addItem(label, km.id)
                 self._km_list.append(km)
         finally:
@@ -169,8 +197,14 @@ class DiscountDialog(QDialog):
         root.addWidget(_lbl("Khuyến mãi:"))
         root.addWidget(self.cb_km)
 
-        self.lbl_preview = _lbl("Tiền giảm:  0 đ", GOLD, 14, True)
+        self.lbl_preview = QLabel()
         self.lbl_preview.setAlignment(Qt.AlignCenter)
+        self.lbl_preview.setWordWrap(True)
+        self.lbl_preview.setStyleSheet(
+            f"color:{GOLD}; font-size:13px; font-weight:bold;"
+            f" background:{BG_CARD}; border-radius:8px; padding:10px;"
+        )
+        self.lbl_preview.setMinimumHeight(52)
         root.addWidget(self.lbl_preview)
 
         self.cb_km.currentIndexChanged.connect(self._preview)
@@ -187,33 +221,135 @@ class DiscountDialog(QDialog):
         row.addWidget(btn_ok)
         root.addLayout(row)
 
-    def _calc(self) -> float:
+    # ── Cache tên SP từ DB ────────────────────────────────────────
+    def _load_sp_cache(self):
+        s = get_session()
+        try:
+            sps = s.query(SanPham).all()
+            for sp in sps:
+                self._sp_cache[sp.id] = sp.ten_sp
+        finally:
+            s.close()
+
+    def _sp_name(self, ma_sp) -> str:
+        if not ma_sp:
+            return "?"
+        return self._sp_cache.get(int(ma_sp), f"SP#{ma_sp}")
+
+    # ── Lấy KM đang chọn ─────────────────────────────────────────
+    def _current_km(self):
         km_id = self.cb_km.currentData()
         if not km_id:
-            return 0.0
+            return None
         for km in self._km_list:
             if km.id == km_id:
-                kieu = getattr(km, 'kieu_giam', '')
-                val  = float(getattr(km, 'gia_tri_giam', 0) or 0)
-                if kieu == "PhanTram":
-                    d = self.grand_total * val / 100.0
-                    cap = getattr(km, 'toi_da_giam', None)
-                    if cap:
-                        try:
-                            d = min(d, float(cap))
-                        except Exception:
-                            pass
-                    return d
-                # fixed amount
-                return min(val, self.grand_total)
-        return 0.0
+                return km
+        return None
 
+    # ── Đếm số lượng món X trong hóa đơn ─────────────────────────
+    def _dem_qty_sp_mua(self, ma_sp: int) -> int:
+        """Đếm tổng qty của sp có ma_sp trong hóa đơn (so sánh qua tên)."""
+        ten_can = self._sp_name(ma_sp)
+        total = 0
+        for it in self.invoice_items:
+            if it.get("name", "").strip() == ten_can.strip():
+                total += it.get("qty", 0)
+        return total
+
+    # ── Kiểm tra điều kiện MuaXTangY ─────────────────────────────
+    def _check_mxy(self, km) -> tuple[bool, str, int]:
+        """
+        Trả về (ok, thong_bao, so_luong_tang_thuc_te).
+        so_luong_tang_thuc_te = (qty_x // so_luong_mua) * so_luong_tang
+        """
+        ma_sp_mua   = km.ma_sp
+        sl_can_mua  = int(km.so_luong_mua or 1)
+        sl_tang_1bo = int(km.so_luong_tang or 1)
+        ten_x       = self._sp_name(ma_sp_mua)
+        ten_y       = self._sp_name(km.ma_sp_tang)
+
+        qty_co = self._dem_qty_sp_mua(ma_sp_mua)
+        if qty_co < sl_can_mua:
+            con_thieu = sl_can_mua - qty_co
+            msg = (
+                f"Cần thêm {con_thieu} × {ten_x} nữa\n"
+                f"(Yêu cầu: {sl_can_mua},  trong hóa đơn: {qty_co})"
+            )
+            return False, msg, 0
+
+        so_bo       = qty_co // sl_can_mua   # số bộ đủ điều kiện
+        tong_tang   = sl_tang_1bo             # luôn tặng đúng 1 bộ (sl_tang), không nhân
+        msg_ok = (
+            f"✅  Đủ điều kiện!  ({qty_co} × {ten_x})\n"
+            f"Mua {sl_can_mua} {ten_x}  →  Tặng {tong_tang} {ten_y} (miễn phí)"
+        )
+        return True, msg_ok, tong_tang
+
+    # ── Tính tiền giảm (KM thường) ───────────────────────────────
+    def _calc_discount(self, km) -> float:
+        kieu = getattr(km, 'kieu_giam', '')
+        val  = float(getattr(km, 'gia_tri_giam', 0) or 0)
+        if kieu == "PhanTram":
+            d = self.grand_total * val / 100.0
+            cap = float(getattr(km, 'toi_da_giam', None) or 0)
+            if cap:
+                d = min(d, cap)
+            return d
+        return min(val, self.grand_total)
+
+    # ── Preview real-time ────────────────────────────────────────
     def _preview(self):
-        self.lbl_preview.setText(f"Tiền giảm:  -{int(self._calc()):,} đ")
+        km = self._current_km()
+        if km is None:
+            self.lbl_preview.setText("Tiền giảm:  0 đ")
+            self.lbl_preview.setStyleSheet(
+                f"color:{TEXT_DIM}; font-size:13px; background:{BG_CARD};"
+                f" border-radius:8px; padding:10px;"
+            )
+            return
 
+        loai = getattr(km, 'loai_km', '') or ''
+        if loai == "MuaXTangY":
+            ok, msg, _ = self._check_mxy(km)
+            color = "#2ECC71" if ok else RED
+            self.lbl_preview.setText(msg)
+            self.lbl_preview.setStyleSheet(
+                f"color:{color}; font-size:13px; font-weight:bold;"
+                f" background:{BG_CARD}; border-radius:8px; padding:10px;"
+            )
+        else:
+            disc = self._calc_discount(km)
+            self.lbl_preview.setText(f"Tiền giảm:  -{int(disc):,} đ")
+            self.lbl_preview.setStyleSheet(
+                f"color:{GOLD}; font-size:14px; font-weight:bold;"
+                f" background:{BG_CARD}; border-radius:8px; padding:10px;"
+            )
+
+    # ── Áp dụng ──────────────────────────────────────────────────
     def _apply(self):
-        self.result_km_id    = self.cb_km.currentData()
-        self.result_discount = self._calc()
+        km = self._current_km()
+        if km is None:
+            # Bỏ KM
+            self.result_km_id    = None
+            self.result_discount = 0.0
+            self.result_gift     = None
+            self.accept()
+            return
+
+        loai = getattr(km, 'loai_km', '') or ''
+        if loai == "MuaXTangY":
+            ok, msg, qty_tang = self._check_mxy(km)
+            if not ok:
+                QMessageBox.warning(self, "Chưa đủ điều kiện", msg)
+                return
+            ten_y = self._sp_name(km.ma_sp_tang)
+            self.result_km_id    = km.id
+            self.result_discount = 0.0
+            self.result_gift     = {"name": ten_y, "qty": qty_tang}
+        else:
+            self.result_km_id    = km.id
+            self.result_discount = self._calc_discount(km)
+            self.result_gift     = None
         self.accept()
 
 
@@ -352,7 +488,7 @@ class InvoiceTable(QTableWidget):
     # ── Public ──────────────────────────────────────────────────
     def add_item(self, name: str, price: float):
         for it in self._items:
-            if it["name"] == name:
+            if it["name"] == name and not it.get("is_gift"):
                 it["qty"] += 1
                 self._refresh()
                 return
@@ -360,8 +496,31 @@ class InvoiceTable(QTableWidget):
             "name": name, "qty": 1, "price": price,
             "note": "", "topping": "Không topping",
             "da": "Bình thường", "duong": "Vừa",
+            "is_gift": False,
         })
         self._refresh()
+
+    def add_gift(self, name: str, qty: int):
+        """Thêm/cập nhật dòng quà tặng MuaXTangY (giá 0, khoá chỉnh sửa)."""
+        for it in self._items:
+            if it.get("is_gift") and it["name"] == name:
+                it["qty"] = qty
+                self._refresh()
+                return
+        self._items.append({
+            "name": name, "qty": qty, "price": 0.0,
+            "note": "", "topping": "Không topping",
+            "da": "Bình thường", "duong": "Vừa",
+            "is_gift": True,
+        })
+        self._refresh()
+
+    def remove_gifts(self):
+        """Xoá tất cả dòng quà tặng (gọi trước khi mở lại DiscountDialog)."""
+        before = len(self._items)
+        self._items = [it for it in self._items if not it.get("is_gift")]
+        if len(self._items) != before:
+            self._refresh()
 
     def get_items(self) -> list[dict]:
         return list(self._items)
@@ -371,7 +530,8 @@ class InvoiceTable(QTableWidget):
         self._refresh()
 
     def grand_total(self) -> float:
-        return sum(it["qty"] * it["price"] for it in self._items)
+        # Quà tặng price=0 nên không ảnh hưởng, nhưng lọc rõ để chắc chắn
+        return sum(it["qty"] * it["price"] for it in self._items if not it.get("is_gift"))
 
     # ── Render ──────────────────────────────────────────────────
     def _refresh(self):
@@ -381,13 +541,17 @@ class InvoiceTable(QTableWidget):
 
         for row, it in enumerate(self._items):
             self.insertRow(row)
+            is_gift = it.get("is_gift", False)
 
-            # Tên món + tóm tắt tùy chỉnh
+            # Tên món
             extras = []
-            if it["topping"] != "Không topping": extras.append(it["topping"])
-            if it["da"]      != "Bình thường":   extras.append(it["da"])
-            if it["duong"]   != "Vừa":           extras.append(it["duong"])
-            if it["note"]:                        extras.append(f"📝 {it['note']}")
+            if is_gift:
+                extras.append("🎁 Quà tặng — miễn phí")
+            else:
+                if it["topping"] != "Không topping": extras.append(it["topping"])
+                if it["da"]      != "Bình thường":   extras.append(it["da"])
+                if it["duong"]   != "Vừa":           extras.append(it["duong"])
+                if it["note"]:                        extras.append(f"📝 {it['note']}")
 
             display = it["name"]
             row_h   = 40
@@ -396,53 +560,70 @@ class InvoiceTable(QTableWidget):
                 row_h    = 54
             self.setRowHeight(row, row_h)
 
+            fg_main = "#2ECC71" if is_gift else TEXT
+
             name_it = QTableWidgetItem(display)
-            name_it.setForeground(QColor(TEXT))
+            name_it.setForeground(QColor(fg_main))
             self.setItem(row, self.COL_NAME, name_it)
 
             # SL
             qty_it = QTableWidgetItem(str(it["qty"]))
             qty_it.setTextAlignment(Qt.AlignCenter)
-            qty_it.setForeground(QColor(TEXT))
+            qty_it.setForeground(QColor(fg_main))
             self.setItem(row, self.COL_QTY, qty_it)
 
-            # Đơn Giá ← MỚI
-            price_it = QTableWidgetItem(f"{int(it['price']):,}đ")
+            # Đơn Giá
+            price_txt = "0 đ  🎁" if is_gift else f"{int(it['price']):,}đ"
+            price_it  = QTableWidgetItem(price_txt)
             price_it.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
-            price_it.setForeground(QColor(TEXT_DIM))
+            price_it.setForeground(QColor("#2ECC71" if is_gift else TEXT_DIM))
             self.setItem(row, self.COL_PRICE, price_it)
 
             # Thành Tiền
-            total_it = QTableWidgetItem(f"{int(it['qty'] * it['price']):,}đ")
+            total_txt = "0 đ" if is_gift else f"{int(it['qty'] * it['price']):,}đ"
+            total_it  = QTableWidgetItem(total_txt)
             total_it.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
-            total_it.setForeground(QColor(GOLD))
+            total_it.setForeground(QColor("#2ECC71" if is_gift else GOLD))
             self.setItem(row, self.COL_TOTAL, total_it)
 
-            # Nút −/+
-            btn_w = QWidget()
-            btn_w.setStyleSheet("background:transparent;")
-            hl = QHBoxLayout(btn_w)
-            hl.setContentsMargins(2, 2, 2, 2)
-            hl.setSpacing(3)
-            btn_m = QPushButton("−")
-            btn_p = QPushButton("+")
-            for b, c in [(btn_m, RED), (btn_p, GREEN)]:
-                b.setFixedSize(28, 28)
-                b.setStyleSheet(
-                    f"background:{c}; color:white; font-weight:bold;"
-                    f" font-size:15px; border-radius:5px; padding:0;"
-                )
-            btn_m.clicked.connect(lambda _, r=row: self._dec(r))
-            btn_p.clicked.connect(lambda _, r=row: self._inc(r))
-            hl.addWidget(btn_m)
-            hl.addWidget(btn_p)
-            self.setCellWidget(row, self.COL_BTN, btn_w)
+            # Nút −/+ hoặc 🔒
+            if is_gift:
+                lock_w = QWidget()
+                lock_w.setStyleSheet("background:transparent;")
+                ll = QHBoxLayout(lock_w)
+                ll.setContentsMargins(0, 0, 0, 0)
+                lbl_lock = QLabel("🔒")
+                lbl_lock.setAlignment(Qt.AlignCenter)
+                lbl_lock.setStyleSheet("color:#2ECC71; font-size:16px; background:transparent;")
+                ll.addWidget(lbl_lock)
+                self.setCellWidget(row, self.COL_BTN, lock_w)
+            else:
+                btn_w = QWidget()
+                btn_w.setStyleSheet("background:transparent;")
+                hl = QHBoxLayout(btn_w)
+                hl.setContentsMargins(2, 2, 2, 2)
+                hl.setSpacing(3)
+                btn_m = QPushButton("−")
+                btn_p = QPushButton("+")
+                for b, c in [(btn_m, RED), (btn_p, GREEN)]:
+                    b.setFixedSize(28, 28)
+                    b.setStyleSheet(
+                        f"background:{c}; color:white; font-weight:bold;"
+                        f" font-size:15px; border-radius:5px; padding:0;"
+                    )
+                btn_m.clicked.connect(lambda _, r=row: self._dec(r))
+                btn_p.clicked.connect(lambda _, r=row: self._inc(r))
+                hl.addWidget(btn_m)
+                hl.addWidget(btn_p)
+                self.setCellWidget(row, self.COL_BTN, btn_w)
 
         self.order_changed.emit()
 
     # ── Click đơn: cột SL → inline edit ─────────────────────────
     def _on_click(self, row: int, col: int):
-        if col != self.COL_QTY or row >= len(self._items):
+        if row >= len(self._items) or self._items[row].get("is_gift"):
+            return
+        if col != self.COL_QTY:
             return
         if self._qty_le is not None and self._qty_row != row:
             self._commit_qty()
@@ -494,7 +675,7 @@ class InvoiceTable(QTableWidget):
 
     # ── Đúp: mở ToppingDialog ────────────────────────────────────
     def _on_double_click(self, row: int, col: int):
-        if row >= len(self._items):
+        if row >= len(self._items) or self._items[row].get("is_gift"):
             return
         self._qty_le  = None
         self._qty_row = -1
@@ -504,12 +685,12 @@ class InvoiceTable(QTableWidget):
 
     # ── Tăng/giảm SL ────────────────────────────────────────────
     def _inc(self, row: int):
-        if row < len(self._items):
+        if row < len(self._items) and not self._items[row].get("is_gift"):
             self._items[row]["qty"] += 1
             self._refresh()
 
     def _dec(self, row: int):
-        if row < len(self._items):
+        if row < len(self._items) and not self._items[row].get("is_gift"):
             if self._items[row]["qty"] <= 1:
                 self._items.pop(row)
             else:
@@ -851,10 +1032,20 @@ class POSScreen(QWidget):
 
     # ── Áp dụng khuyến mãi ──────────────────────────────────────
     def _apply_discount(self):
-        dlg = DiscountDialog(self.invoice.grand_total(), parent=self)
+        # Xoá quà tặng cũ trước (tránh tính vào điều kiện kiểm tra)
+        self.invoice.remove_gifts()
+
+        dlg = DiscountDialog(
+            grand_total   = self.invoice.grand_total(),
+            invoice_items = self.invoice.get_items(),
+            parent        = self,
+        )
         if dlg.exec():
             self.km_id       = dlg.result_km_id
             self.km_discount = dlg.result_discount
+            if dlg.result_gift:
+                g = dlg.result_gift
+                self.invoice.add_gift(g["name"], g["qty"])
             self._update_totals()
 
     # ── Thanh toán ───────────────────────────────────────────────
@@ -866,17 +1057,25 @@ class POSScreen(QWidget):
 
         order_items = []
         for it in items:
-            parts = []
-            if it["topping"] != "Không topping": parts.append(it["topping"])
-            if it["da"]      != "Bình thường":   parts.append(it["da"])
-            if it["duong"]   != "Vừa":           parts.append(it["duong"])
-            if it["note"]:                        parts.append(it["note"])
-            order_items.append({
-                "name":  it["name"],
-                "qty":   it["qty"],
-                "price": it["price"],
-                "note":  " | ".join(parts),
-            })
+            if it.get("is_gift"):
+                order_items.append({
+                    "name":  it["name"],
+                    "qty":   it["qty"],
+                    "price": 0.0,
+                    "note":  "🎁 Quà tặng KM",
+                })
+            else:
+                parts = []
+                if it["topping"] != "Không topping": parts.append(it["topping"])
+                if it["da"]      != "Bình thường":   parts.append(it["da"])
+                if it["duong"]   != "Vừa":           parts.append(it["duong"])
+                if it["note"]:                        parts.append(it["note"])
+                order_items.append({
+                    "name":  it["name"],
+                    "qty":   it["qty"],
+                    "price": it["price"],
+                    "note":  " | ".join(parts),
+                })
 
         ok, msg = process_checkout(
             order_items, self.nhan_vien_id,

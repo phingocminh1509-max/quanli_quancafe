@@ -698,18 +698,53 @@ class POSWindow(QMainWindow):
         km_line = ""
         if self._applied_km:
             km = self._applied_km
-            if km["kieu"] == "PhanTram":
+
+            if km.get("_mxy"):
+                # MuaXTangY — kiểm tra lại điều kiện mỗi khi hóa đơn thay đổi
+                ten_x    = km["ten_x"]
+                sl_can   = km["sl_can_mua"]
+                sl_tang  = km["sl_tang"]
+                ten_y    = km["ten_y"]
+                qty_co   = sum(
+                    it.get("qty", 0)
+                    for it in self.order_table.get_items()
+                    if not it.get("is_gift") and it.get("name", "") == ten_x
+                )
+                if qty_co < sl_can:
+                    # Không còn đủ điều kiện → xóa quà + clear KM
+                    self.order_table.remove_gifts()
+                    self._applied_km = None
+                    self._km_user_picked = False
+                else:
+                    # Cập nhật lại số lượng quà nếu qty_co thay đổi
+                    so_bo     = qty_co // sl_can
+                    tong_tang = sl_tang   # luôn tặng đúng sl_tang cố định
+                    if tong_tang != km.get("tong_tang"):
+                        km["tong_tang"] = tong_tang
+                        self.order_table.remove_gifts()
+                        self.order_table.add_gift(ten_y + " (Quà tặng)", tong_tang)
+                    km_line = (
+                        f"<span style='font-size:13px; color:#27AE60;'>"
+                        f"🎁 KM [{km['ten']}]: Tặng {tong_tang}× {ten_y}"
+                        f"</span><br>"
+                    )
+            elif km["kieu"] == "PhanTram":
                 giam = subtotal * km["gia_tri"] / 100
                 if km.get("tran") and giam > km["tran"]:
                     giam = km["tran"]
                 self._km_discount = giam
+                km_line = (
+                    f"<span style='font-size:13px; color:#E67E22;'>"
+                    f"🎉 KM [{km['ten']}]: -{int(self._km_discount):,.0f} đ"
+                    f"</span><br>"
+                )
             elif km["kieu"] == "TienMat":
                 self._km_discount = min(km["gia_tri"], subtotal)
-            km_line = (
-                f"<span style='font-size:13px; color:#E67E22;'>"
-                f"🎉 KM [{km['ten']}]: -{int(self._km_discount):,.0f} đ"
-                f"</span><br>"
-            )
+                km_line = (
+                    f"<span style='font-size:13px; color:#E67E22;'>"
+                    f"🎉 KM [{km['ten']}]: -{int(self._km_discount):,.0f} đ"
+                    f"</span><br>"
+                )
 
         total_to_pay = max(0, subtotal - self._km_discount)
         self.total_label.setText(
@@ -724,18 +759,26 @@ class POSWindow(QMainWindow):
         # Cập nhật label KM đang áp dụng
         if self._applied_km:
             km = self._applied_km
-            if km["kieu"] == "PhanTram":
+            if km.get("_mxy"):
+                tong_t = km.get("tong_tang", km["sl_tang"])
+                mo_ta  = f"Mua {km['sl_can_mua']} {km['ten_x']}  →  Tặng {tong_t} {km['ten_y']} (miễn phí)"
+                self.lbl_km_applied.setText(f"✓ {km['ten']}\n   {mo_ta}")
+            elif km["kieu"] == "PhanTram":
                 mo_ta = f"Giảm {int(km['gia_tri'])}%"
                 if km.get("tran"):
                     mo_ta += f" (tối đa {int(km['tran']):,}đ)"
+                self.lbl_km_applied.setText(
+                    f"✓ {km['ten']}\n"
+                    f"   {mo_ta}  →  -{int(self._km_discount):,}đ"
+                )
             elif km["kieu"] == "TienMat":
                 mo_ta = f"Giảm {int(km['gia_tri']):,}đ"
+                self.lbl_km_applied.setText(
+                    f"✓ {km['ten']}\n"
+                    f"   {mo_ta}  →  -{int(self._km_discount):,}đ"
+                )
             else:
-                mo_ta = km["ten"]
-            self.lbl_km_applied.setText(
-                f"✓ {km['ten']}\n"
-                f"   {mo_ta}  →  -{int(self._km_discount):,}đ"
-            )
+                self.lbl_km_applied.setText(f"✓ {km['ten']}")
             self.lbl_km_applied.setVisible(True)
         else:
             self.lbl_km_applied.setVisible(False)
@@ -1180,18 +1223,22 @@ class POSWindow(QMainWindow):
         """
         Tự động tìm và áp KM tốt nhất hợp lệ cho đơn hàng hiện tại.
         Chỉ áp dụng khi chưa có KM nào. Không hỏi xác nhận — âm thầm áp.
+
+        Quy tắc bắt buộc:
+          • KHÔNG auto-apply KM đổi điểm (la_doi_diem=1) — phải chọn thủ công
+          • KHÔNG auto-apply khi chưa liên kết khách hàng với KM cá nhân
+          • KHÔNG auto-apply MuaXTangY
         """
         try:
             from datetime import datetime, date
             from database.db_config import get_session
             from database.models import KhuyenMai
 
-            # Tính tổng đơn hiện tại
             grand_total = self.order_table.grand_total()
             if grand_total <= 0:
                 return
 
-            now = datetime.now()
+            now   = datetime.now()
             today = date.today()
 
             s = get_session()
@@ -1204,13 +1251,24 @@ class POSWindow(QMainWindow):
             best_giam = 0
 
             for km in kms:
-                # Kiểm tra ngày hợp lệ
+                # ── Bỏ qua KM đổi điểm — phải chọn thủ công ──────
+                if int(getattr(km, 'la_doi_diem', 0) or 0):
+                    continue
+                # Bỏ qua nếu loai_nhom là DoiDiem
+                if getattr(km, 'loai_nhom', 'Chung') == 'DoiDiem':
+                    continue
+
+                # ── Bỏ qua MuaXTangY ──────────────────────────────
+                if km.loai_km == "MuaXTangY":
+                    continue
+
+                # ── Kiểm tra ngày ──────────────────────────────────
                 if km.ngay_bat_dau and today < km.ngay_bat_dau:
                     continue
                 if km.ngay_ket_thuc and today > km.ngay_ket_thuc:
                     continue
 
-                # Kiểm tra khung giờ
+                # ── Kiểm tra khung giờ ─────────────────────────────
                 gio_tu  = getattr(km, 'gio_tu',  None)
                 gio_den = getattr(km, 'gio_den', None)
                 if gio_tu and gio_den:
@@ -1218,21 +1276,17 @@ class POSWindow(QMainWindow):
                     if not (gio_tu <= t <= gio_den):
                         continue
 
-                # Kiểm tra lượt dùng
+                # ── Kiểm tra lượt dùng ─────────────────────────────
                 if km.so_luot_toi_da and km.so_luot_da_dung and \
                         km.so_luot_da_dung >= km.so_luot_toi_da:
                     continue
 
-                # Kiểm tra điều kiện tối thiểu
+                # ── Kiểm tra điều kiện tổng tiền ──────────────────
                 dk = km.dk_tong_tien_tu or 0
                 if grand_total < dk:
                     continue
 
-                # Bỏ qua MuaXTangY (phức tạp, không auto-apply)
-                if km.loai_km == "MuaXTangY":
-                    continue
-
-                # Tính tiền giảm
+                # ── Tính tiền giảm ─────────────────────────────────
                 if km.kieu_giam == "PhanTram":
                     giam = grand_total * (km.gia_tri_giam or 0) / 100
                     if km.toi_da_giam:
@@ -1240,17 +1294,13 @@ class POSWindow(QMainWindow):
                 else:
                     giam = km.gia_tri_giam or 0
 
-                # Ưu tiên: giam nhiều hơn hoặc cùng giam nhưng uu_tien cao hơn
-                uu = int(getattr(km, 'uu_tien', 0) or 0)
-                if giam > best_giam or (giam == best_giam and uu > getattr(best_km, '_uu', 0)):
+                if giam > best_giam:
                     best_giam = giam
                     best_km   = km
-                    km._uu    = uu
 
             if not best_km or best_giam <= 0:
                 return
 
-            # Áp dụng âm thầm
             self._applied_km  = {
                 "id":      best_km.id,
                 "ten":     best_km.ten_km,
@@ -1297,18 +1347,24 @@ class POSWindow(QMainWindow):
             QMessageBox.warning(self, "Hóa đơn trống", "Hãy thêm món trước!")
             return
 
+        # Kiểm tra tổng tiền thực sự > 0
+        grand_total_check = self.order_table.grand_total()
+        if grand_total_check <= 0:
+            QMessageBox.warning(
+                self, "Hóa đơn trống",
+                "Tổng tiền đơn hàng = 0đ.\n"
+                "Vui lòng thêm món có giá tiền hợp lệ trước khi áp dụng khuyến mãi."
+            )
+            return
+
         self._migrate_km_cols()
 
         from database.db_config import get_session
         from database.models import KhuyenMai, Voucher
         from datetime import date
 
-        grand_total = 0
-        for row in range(self.order_table.rowCount()):
-            item = self.order_table.item(row, 2)
-            if item and item.text().strip() and item.data(Qt.UserRole) != "note_row":
-                try: grand_total += float(item.text().replace(",", ""))
-                except ValueError: pass
+        # Lấy tổng tiền trực tiếp từ InvoiceTable (đúng qty * price)
+        grand_total = self.order_table.grand_total()
         subtotal = grand_total * 1.10
 
         session = get_session()
@@ -1318,7 +1374,8 @@ class POSWindow(QMainWindow):
 
             def _tinh_giam(km):
                 if km.kieu_giam == "PhanTram":
-                    g = subtotal * float(km.gia_tri_giam or 0) / 100
+                    pct = min(float(km.gia_tri_giam or 0), 100.0)  # cap tối đa 100%
+                    g   = subtotal * pct / 100
                     if km.toi_da_giam: g = min(g, float(km.toi_da_giam))
                     return g
                 elif km.kieu_giam == "TienMat":
@@ -1338,16 +1395,61 @@ class POSWindow(QMainWindow):
             km_chung = []
             for km in kms:
                 if not _base_ok(km): continue
-                if int(getattr(km, "la_doi_diem", 0) or 0): continue  # bỏ qua KM đổi điểm
-                g = _tinh_giam(km)
-                km_chung.append({
-                    "id": km.id, "ten": km.ten_km or "—",
-                    "loai": km.loai_km or "", "kieu": km.kieu_giam or "",
-                    "gia_tri": float(km.gia_tri_giam or 0),
-                    "tran": float(km.toi_da_giam or 0) or None,
-                    "dk_min": float(km.dk_tong_tien_tu or 0),
-                    "diem_can": 0, "loai_nhom": "Chung", "_giam": g,
-                })
+                if int(getattr(km, "la_doi_diem", 0) or 0): continue
+
+                loai_km = km.loai_km or ""
+
+                if loai_km == "MuaXTangY":
+                    # Kiểm tra điều kiện ngay khi build list
+                    ma_sp_mua   = km.ma_sp
+                    sl_can_mua  = int(km.so_luong_mua or 1)
+                    sl_tang     = int(km.so_luong_tang or 1)
+                    ma_sp_tang  = km.ma_sp_tang
+                    # Đếm qty sp mua trong hóa đơn
+                    sp_cache    = {}
+                    qty_co      = 0
+                    ten_x = ten_y = "?"
+                    try:
+                        from database.models import SanPham as _SP
+                        _s2 = get_session()
+                        sp_x = _s2.get(_SP, ma_sp_mua) if ma_sp_mua else None
+                        sp_y = _s2.get(_SP, ma_sp_tang) if ma_sp_tang else None
+                        ten_x = sp_x.ten_sp if sp_x else f"SP#{ma_sp_mua}"
+                        ten_y = sp_y.ten_sp if sp_y else f"SP#{ma_sp_tang}"
+                        _s2.close()
+                    except Exception:
+                        pass
+                    for it in self.order_table.get_items():
+                        if not it.get("is_gift") and it.get("name","") == ten_x:
+                            qty_co += it.get("qty", 0)
+                    du_dk = qty_co >= sl_can_mua
+                    tong_tang = sl_tang if du_dk else 0
+                    g = 0.0  # MuaXTangY không tính tiền giảm số
+                    km_chung.append({
+                        "id": km.id, "ten": km.ten_km or "—",
+                        "loai": loai_km, "kieu": "",
+                        "gia_tri": 0.0, "tran": None, "dk_min": 0.0,
+                        "diem_can": 0, "loai_nhom": "Chung", "_giam": 0.0,
+                        # Extra fields cho MuaXTangY
+                        "_mxy": True,
+                        "ten_x": ten_x, "ten_y": ten_y,
+                        "sl_can_mua": sl_can_mua, "sl_tang": sl_tang,
+                        "tong_tang": tong_tang, "du_dk": du_dk,
+                        "msg": (
+                            f"✅Mua {sl_can_mua} {ten_x}  →  Tặng {tong_tang} {ten_y} (miễn phí)"
+                
+                        ),
+                    })
+                else:
+                    g = _tinh_giam(km)
+                    km_chung.append({
+                        "id": km.id, "ten": km.ten_km or "—",
+                        "loai": loai_km, "kieu": km.kieu_giam or "",
+                        "gia_tri": float(km.gia_tri_giam or 0),
+                        "tran": float(km.toi_da_giam or 0) or None,
+                        "dk_min": float(km.dk_tong_tien_tu or 0),
+                        "diem_can": 0, "loai_nhom": "Chung", "_giam": g,
+                    })
             km_chung.sort(key=lambda x: -x["_giam"])
 
             # ── Nhóm 2: KM Đổi Điểm (la_doi_diem = 1) + Voucher cá nhân ──
@@ -1357,17 +1459,46 @@ class POSWindow(QMainWindow):
                     if not _base_ok(km): continue
                     if not int(getattr(km, "la_doi_diem", 0) or 0): continue
                     diem_can = int(getattr(km, "diem_can", 0) or 0)
-                    # Chỉ hiện nếu đủ điểm
                     if diem_can > 0 and kh_diem < diem_can: continue
-                    g = _tinh_giam(km)
-                    km_doi_diem.append({
-                        "id": km.id, "ten": km.ten_km or "—",
-                        "loai": km.loai_km or "", "kieu": km.kieu_giam or "",
-                        "gia_tri": float(km.gia_tri_giam or 0),
-                        "tran": float(km.toi_da_giam or 0) or None,
-                        "dk_min": float(km.dk_tong_tien_tu or 0),
-                        "diem_can": diem_can, "loai_nhom": "DoiDiem", "_giam": g,
-                    })
+
+                    loai_km = km.loai_km or ""
+
+                    if loai_km == "MuaXTangY":
+                        # Lấy tên SP mua và tặng
+                        try:
+                            from database.models import SanPham as _SP2
+                            _s3 = get_session()
+                            _spx = _s3.get(_SP2, km.ma_sp)      if km.ma_sp      else None
+                            _spy = _s3.get(_SP2, km.ma_sp_tang) if km.ma_sp_tang else None
+                            _tx  = _spx.ten_sp if _spx else "sản phẩm"
+                            _ty  = _spy.ten_sp if _spy else "sản phẩm"
+                            _s3.close()
+                        except Exception:
+                            _tx = _ty = "sản phẩm"
+                        sl_x = int(km.so_luong_mua  or 1)
+                        sl_y = int(km.so_luong_tang or 1)
+                        km_doi_diem.append({
+                            "id": km.id, "ten": km.ten_km or "—",
+                            "loai": loai_km, "kieu": "",
+                            "gia_tri": 0.0, "tran": None,
+                            "dk_min": float(km.dk_tong_tien_tu or 0),
+                            "diem_can": diem_can, "loai_nhom": "DoiDiem", "_giam": 0.0,
+                            "_mxy": True,
+                            "ten_x": _tx, "ten_y": _ty,
+                            "sl_can_mua": sl_x, "sl_tang": sl_y,
+                            "tong_tang": sl_y, "du_dk": True,
+                            "msg": f"Mua {sl_x} {_tx}  →  Tặng {sl_y} {_ty} miễn phí",
+                        })
+                    else:
+                        g = _tinh_giam(km)
+                        km_doi_diem.append({
+                            "id": km.id, "ten": km.ten_km or "—",
+                            "loai": loai_km, "kieu": km.kieu_giam or "",
+                            "gia_tri": float(km.gia_tri_giam or 0),
+                            "tran": float(km.toi_da_giam or 0) or None,
+                            "dk_min": float(km.dk_tong_tien_tu or 0),
+                            "diem_can": diem_can, "loai_nhom": "DoiDiem", "_giam": g,
+                        })
                 km_doi_diem.sort(key=lambda x: -x["_giam"])
 
             # Voucher cá nhân của KH đang liên kết
@@ -1453,21 +1584,66 @@ class POSWindow(QMainWindow):
 
             row_data = []
             for d in data_list:
-                if d["kieu"] == "PhanTram":
-                    uu = f"Giảm {int(d['gia_tri'])}%"
-                    if d["tran"]: uu += f" (tối đa {int(d['tran']):,}đ)"
-                elif d["kieu"] == "TienMat":
-                    uu = f"Giảm {int(d['gia_tri']):,}đ"
-                elif d["loai"] == "MuaXTangY":
-                    uu = "Mua X Tặng Y"
-                else:
-                    uu = d["loai"] or "—"
-                dk = f"  ·  Đơn ≥{int(d['dk_min']):,}đ" if d.get("dk_min") else ""
-                sv = f"-{int(d['_giam']):,}đ" if d.get("_giam") else "—"
+                dk = f"  ·  Đơn từ {int(d['dk_min']):,}đ" if d.get("dk_min") else ""
+                _giam_val = d.get("_giam", 0) or 0
 
-                r = tbl.rowCount(); tbl.insertRow(r); tbl.setRowHeight(r, 42)
-                it0 = QTableWidgetItem(f"  {d['ten']}  ·  {uu}{dk}")
-                it0.setForeground(QColor("#E8E8F0")); it0.setData(Qt.UserRole, d)
+                if d.get("_mxy"):
+                    # MuaXTangY — msg đã rõ
+                    uu = d.get("msg") or (
+                        f"Mua {d.get('sl_can_mua',1)} {d.get('ten_x','SP')}"
+                        f"  →  Tặng {d.get('sl_tang',1)} {d.get('ten_y','SP')} miễn phí"
+                    )
+                    dk = ""
+                    sv = (
+                        f"Tặng {d.get('sl_tang',1)} {d.get('ten_y','SP')}"
+                        if d.get("du_dk") else "Chưa đủ điều kiện"
+                    )
+
+                elif d["kieu"] == "PhanTram":
+                    pct = min(float(d["gia_tri"]), 100.0)   # cap 100%
+                    uu  = f"Giảm {int(pct)}% cho toàn đơn"
+                    if d.get("tran"): uu += f" (tối đa {int(d['tran']):,}đ)"
+                    sv  = f"-{int(_giam_val):,}đ" if _giam_val > 0 else "—"
+
+                elif d["kieu"] == "TienMat":
+                    uu = f"Giảm {int(d['gia_tri']):,}đ cho toàn đơn"
+                    sv = f"-{int(_giam_val):,}đ" if _giam_val > 0 else "—"
+
+                elif d.get("loai_nhom") == "Voucher":
+                    # Voucher cá nhân — đọc kieu + gia_tri từ voucher
+                    kieu_v = d.get("kieu", "")
+                    gt_v   = float(d.get("gia_tri", 0))
+                    tran_v = d.get("tran")
+                    if kieu_v == "PhanTram" and gt_v > 0:
+                        pct_v = min(gt_v, 100.0)
+                        uu = f"Giảm {int(pct_v)}% cho toàn đơn"
+                        if tran_v: uu += f" (tối đa {int(tran_v):,}đ)"
+                    elif kieu_v == "TienMat" and gt_v > 0:
+                        uu = f"Giảm {int(gt_v):,}đ cho toàn đơn"
+                    else:
+                        ten_v = (d.get("ten") or "Voucher")
+                        uu = ten_v.replace("[Đổi điểm] ","").replace("[đổi điểm] ","")
+                    sv = f"-{int(_giam_val):,}đ" if _giam_val > 0 else "—"
+
+                else:
+                    uu = d.get("ten") or d.get("loai") or "Ưu đãi"
+                    sv = "—"
+
+                # Đổi điểm: thêm số điểm cần ở đầu
+                if d.get("loai_nhom") == "DoiDiem" and d.get("diem_can", 0):
+                    uu = f"Dùng {int(d['diem_can']):,} điểm  →  {uu}"
+
+                r = tbl.rowCount(); tbl.insertRow(r); tbl.setRowHeight(r, 44)
+                row_text = f"  {d['ten']}  ·  {uu}{dk}"
+                it0 = QTableWidgetItem(row_text)
+                it0.setToolTip(f"{d['ten']}\n{uu}{dk}")
+                if d.get("_mxy"):
+                    it0.setForeground(QColor("#2ECC71" if d.get("du_dk") else "#E74C3C"))
+                elif not d.get("du_dk", True):
+                    it0.setForeground(QColor("#E74C3C"))
+                else:
+                    it0.setForeground(QColor("#E8E8F0"))
+                it0.setData(Qt.UserRole, d)
                 tbl.setItem(r, 0, it0)
 
                 if show_diem:
@@ -1555,10 +1731,262 @@ class POSWindow(QMainWindow):
                 tca.addWidget(tbl_vc)
 
             if km_doi_diem:
-                tca.addWidget(QLabel(
+                lbl_dd_title = QLabel(
                     f"<b style='color:#E67E22;'>🔢 Đổi điểm (bạn có {kh_diem:,} điểm):</b>"
-                ))
+                    f"<span style='color:#A1A1AA;font-size:11px;'>"
+                    f"  — Đúp chuột vào dòng để đổi điểm lấy voucher</span>"
+                )
+                lbl_dd_title.setTextFormat(Qt.RichText)
+                tca.addWidget(lbl_dd_title)
                 tbl_dd, dd_data = _make_km_table(km_doi_diem, show_diem=True)
+
+                # ── Double-click vào dòng đổi điểm → trừ điểm + tạo voucher ──
+                def _on_dd_double_click(row, col):
+                    if row < 0 or row >= len(dd_data):
+                        return
+                    d = dd_data[row]
+                    diem_can = d.get("diem_can", 0)
+
+                    # ── MuaXTangY: đổi điểm → áp quà tặng thẳng vào hóa đơn ──
+                    if d.get("_mxy"):
+                        # Nếu đã có KM MuaXTangY đang áp → không cho đổi thêm trong cùng 1 đơn
+                        if self._applied_km and self._applied_km.get("_mxy"):
+                            QMessageBox.warning(
+                                dlg, "Không thể cộng dồn",
+                                "Đơn này đã áp dụng 1 ưu đãi Mua X Tặng Y rồi.\n\n"
+                                "Mỗi đơn hàng chỉ được áp dụng 1 ưu đãi loại này.\n"
+                                "Bấm '❌ Bỏ KM' trước nếu muốn đổi sang ưu đãi khác."
+                            )
+                            return
+
+                        # Kiểm tra điều kiện số lượng sp X trong hóa đơn hiện tại
+                        ten_x    = d["ten_x"]
+                        sl_can   = d["sl_can_mua"]
+                        sl_tang  = d["sl_tang"]
+                        ten_y    = d["ten_y"]
+                        qty_co   = sum(
+                            it.get("qty", 0)
+                            for it in self.order_table.get_items()
+                            if not it.get("is_gift") and it.get("name", "") == ten_x
+                        )
+                        if qty_co < sl_can:
+                            QMessageBox.warning(
+                                dlg, "Chưa đủ điều kiện",
+                                f"⚠️ KM này yêu cầu mua ít nhất {sl_can}× {ten_x}.\n\n"
+                                f"Hóa đơn hiện có: {qty_co}× {ten_x}.\n"
+                                f"Vui lòng thêm món trước khi đổi điểm."
+                            )
+                            return
+
+                        so_bo     = qty_co // sl_can
+                        tong_tang = sl_tang   # luôn tặng đúng sl_tang cố định
+
+                        # Xác nhận đổi điểm
+                        if QMessageBox.question(
+                            dlg, "Xác nhận đổi điểm",
+                            f"Đổi <b>{diem_can:,} điểm</b> để nhận ưu đãi:<br><br>"
+                            f"🎁 <b>{d['ten']}</b><br>"
+                            f"→ Tặng <b>{tong_tang}× {ten_y}</b> miễn phí<br><br>"
+                            f"Ưu đãi sẽ được áp dụng ngay vào hóa đơn.",
+                            QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+                        ) != QMessageBox.Yes:
+                            return
+
+                        # Trừ điểm
+                        from database.models import KhachHang, LichSuDiemKH
+                        s2 = get_session()
+                        try:
+                            kh_obj = s2.query(KhachHang).filter_by(id=kh_id).first()
+                            if not kh_obj:
+                                QMessageBox.critical(dlg, "Lỗi", "Không tìm thấy khách hàng!"); return
+                            if (kh_obj.diem_tich_luy or 0) < diem_can:
+                                QMessageBox.warning(dlg, "Không đủ điểm",
+                                    f"Khách chỉ còn {kh_obj.diem_tich_luy or 0:,} điểm!"); return
+
+                            kh_obj.diem_tich_luy = (kh_obj.diem_tich_luy or 0) - diem_can
+                            s2.add(LichSuDiemKH(
+                                ma_kh=kh_id,
+                                loai="Đổi điểm",
+                                so_diem=-diem_can,
+                                mo_ta=f"Đổi điểm MuaXTangY tại POS: {d['ten']}",
+                            ))
+                            from database.models import KhuyenMai as _KM
+                            km_obj2 = s2.get(_KM, d["id"])
+                            if km_obj2:
+                                km_obj2.so_luot_da_dung = (km_obj2.so_luot_da_dung or 0) + 1
+                            s2.commit()
+                            diem_con_lai = kh_obj.diem_tich_luy
+                        except Exception as e2:
+                            s2.rollback()
+                            QMessageBox.critical(dlg, "Lỗi", str(e2)); return
+                        finally:
+                            s2.close()
+
+                        # Cập nhật điểm UI
+                        if self._linked_kh:
+                            self._linked_kh["diem"] = diem_con_lai
+                        self._update_loyalty_label()
+
+                        # Xoá quà cũ (nếu có) rồi thêm quà mới — tránh cộng dồn
+                        self.order_table.remove_gifts()
+                        d["tong_tang"] = tong_tang
+                        d["du_dk"]     = True
+                        self.order_table.add_gift(ten_y + " (Quà tặng)", tong_tang)
+                        self._applied_km         = d
+                        self._km_user_picked     = True
+                        self._applied_voucher_id = None
+                        self._km_discount        = 0.0
+                        self.update_grand_total()
+                        _log(self.user.id, "Đổi điểm MuaXTangY",
+                             f"{d['ten']}: trừ {diem_can:,} điểm, tặng {tong_tang}× {ten_y}",
+                             o_dau="POS - Thanh toán")
+
+                        QMessageBox.information(
+                            dlg, "✅ Đổi điểm thành công",
+                            f"Đã trừ {diem_can:,} điểm!\n\n"
+                            f"Đã thêm {tong_tang}× {ten_y} (miễn phí) vào hóa đơn.\n"
+                            f"Điểm còn lại: {diem_con_lai:,}"
+                        )
+                        dlg.accept()
+                        return
+
+                    # ── KM giảm tiền thường: validate + tạo voucher ──────
+                    loai_giam = d.get("kieu", "")
+                    gia_tri   = d.get("gia_tri", 0)
+                    if loai_giam not in ("PhanTram", "TienMat"):
+                        QMessageBox.warning(dlg, "Loại KM không hợp lệ",
+                            f"KM '{d['ten']}' có loại '{loai_giam}' không thể tạo voucher.\n"
+                            "Chỉ hỗ trợ: Giảm % hoặc Giảm tiền.")
+                        return
+                    if not gia_tri or gia_tri <= 0:
+                        QMessageBox.warning(dlg, "Giá trị không hợp lệ",
+                            f"KM '{d['ten']}' có giá trị giảm = 0.\n"
+                            "Vui lòng kiểm tra lại cấu hình KM.")
+                        return
+
+                    # Xác nhận tạo voucher
+                    if QMessageBox.question(
+                        dlg, "Xác nhận đổi điểm",
+                        f"Đổi <b>{diem_can:,} điểm</b> để nhận voucher:<br><br>"
+                        f"🎁 <b>{d['ten']}</b><br><br>"
+                        f"Voucher sẽ được lưu vào tài khoản khách hàng.",
+                        QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+                    ) != QMessageBox.Yes:
+                        return
+
+                    import random, string
+                    from database.models import KhachHang, LichSuDiemKH
+                    from datetime import timedelta, date as _date
+
+                    s2 = get_session()
+                    try:
+                        kh_obj = s2.query(KhachHang).filter_by(id=kh_id).first()
+                        if not kh_obj:
+                            QMessageBox.critical(dlg, "Lỗi", "Không tìm thấy khách hàng!"); return
+                        if (kh_obj.diem_tich_luy or 0) < diem_can:
+                            QMessageBox.warning(dlg, "Không đủ điểm",
+                                f"Khách chỉ còn {kh_obj.diem_tich_luy or 0:,} điểm!"); return
+
+                        kh_obj.diem_tich_luy = (kh_obj.diem_tich_luy or 0) - diem_can
+                        s2.add(LichSuDiemKH(
+                            ma_kh=kh_id,
+                            loai="Đổi điểm",
+                            so_diem=-diem_can,
+                            mo_ta=f"Đổi điểm tại POS: {d['ten']}",
+                        ))
+
+                        vc_code = "VD" + "".join(random.choices(
+                            string.ascii_uppercase + string.digits, k=8))
+                        het_han = _date.today() + timedelta(days=90)
+                        vc_new = Voucher(
+                            ma_kh=kh_id,
+                            ma_code=vc_code,
+                            ten_voucher=f"[Đổi điểm] {d['ten']}",
+                            loai_giam=loai_giam,
+                            gia_tri_giam=gia_tri,
+                            toi_da_giam=d.get("tran"),
+                            dieu_kien_toi_thieu=d.get("dk_min", 0) or 0,
+                            ngay_het_han=het_han,
+                            trang_thai="Chưa dùng",
+                        )
+                        try: vc_new.ma_km = d["id"]
+                        except Exception: pass
+                        s2.add(vc_new)
+
+                        from database.models import KhuyenMai as _KM
+                        km_obj2 = s2.get(_KM, d["id"])
+                        if km_obj2:
+                            km_obj2.so_luot_da_dung = (km_obj2.so_luot_da_dung or 0) + 1
+                        s2.commit()
+                        diem_con_lai = kh_obj.diem_tich_luy
+
+                        if self._linked_kh:
+                            self._linked_kh["diem"] = diem_con_lai
+                        self._update_loyalty_label()
+
+                        QMessageBox.information(
+                            dlg, "✅ Đổi điểm thành công",
+                            f"Đã trừ {diem_can:,} điểm!\n\n"
+                            f"Voucher: {vc_code}\n"
+                            f"Ưu đãi: {d['ten']}\n"
+                            f"Hiệu lực: đến {het_han.strftime('%d/%m/%Y')}\n"
+                            f"Điểm còn lại: {diem_con_lai:,}\n\n"
+                            f"Voucher đã được thêm vào danh sách bên trên.\n"
+                            f"Chọn voucher vừa tạo rồi ấn Áp dụng."
+                        )
+
+                        # Reload danh sách voucher
+                        s3 = get_session()
+                        try:
+                            vcs2 = s3.query(Voucher).filter_by(
+                                ma_kh=kh_id, trang_thai="Chưa dùng").all()
+                            vouchers.clear()
+                            for vc2 in vcs2:
+                                if vc2.ngay_het_han and vc2.ngay_het_han < _date.today(): continue
+                                if vc2.dieu_kien_toi_thieu and subtotal < vc2.dieu_kien_toi_thieu: continue
+                                if vc2.loai_giam == "PhanTram":
+                                    g2 = subtotal * float(vc2.gia_tri_giam or 0) / 100
+                                    if vc2.toi_da_giam: g2 = min(g2, float(vc2.toi_da_giam))
+                                else:
+                                    g2 = min(float(vc2.gia_tri_giam or 0), subtotal)
+                                vouchers.append({
+                                    "id": vc2.id, "ten": vc2.ten_voucher or f"Voucher {vc2.ma_code}",
+                                    "ma_code": vc2.ma_code,
+                                    "loai": "Voucher", "kieu": vc2.loai_giam or "TienMat",
+                                    "gia_tri": float(vc2.gia_tri_giam or 0),
+                                    "tran": float(vc2.toi_da_giam or 0) or None,
+                                    "dk_min": float(vc2.dieu_kien_toi_thieu or 0),
+                                    "diem_can": 0, "loai_nhom": "Voucher", "_giam": g2,
+                                })
+                        finally:
+                            s3.close()
+                        vouchers.sort(key=lambda x: -x["_giam"])
+
+                        nonlocal tbl_vc, vc_data
+                        if tbl_vc is not None:
+                            tca.removeWidget(tbl_vc)
+                            tbl_vc.deleteLater()
+                        tbl_vc, vc_data = _make_km_table(vouchers)
+                        tbl_vc.setMaximumHeight(160)
+                        for idx in range(tca.count()):
+                            w = tca.itemAt(idx).widget()
+                            if w and isinstance(w, QLabel) and "Voucher cá nhân" in w.text():
+                                tca.insertWidget(idx + 1, tbl_vc)
+                                break
+                        else:
+                            lbl_vc2 = QLabel("<b style='color:#3498DB;'>🎟 Voucher cá nhân:</b>")
+                            tca.insertWidget(1, tbl_vc)
+                            tca.insertWidget(1, lbl_vc2)
+                        if tbl_vc.rowCount() > 0:
+                            tbl_vc.selectRow(0)
+
+                    except Exception as e2:
+                        s2.rollback()
+                        QMessageBox.critical(dlg, "Lỗi", str(e2))
+                    finally:
+                        s2.close()
+
+                tbl_dd.cellDoubleClicked.connect(_on_dd_double_click)
                 tca.addWidget(tbl_dd)
             elif not vouchers:
                 lbl_no2 = QLabel("Chưa có voucher hoặc KM đổi điểm nào khả dụng.")
@@ -1616,27 +2044,59 @@ class POSWindow(QMainWindow):
                 QMessageBox.warning(dlg, "Chưa chọn", "Hãy chọn một khuyến mãi hoặc voucher!")
                 return
 
-            # Kiểm tra KM đổi điểm: cần đủ điểm + KH liên kết
-            if sel.get("loai_nhom") == "DoiDiem":
-                diem_can = sel.get("diem_can", 0)
-                if not kh_id:
-                    QMessageBox.warning(dlg, "Cần KH liên kết",
-                        "KM đổi điểm yêu cầu liên kết số điện thoại khách hàng!")
+            # ── MuaXTangY: thêm món quà vào hóa đơn ──────────────
+            if sel.get("_mxy"):
+                # Chặn cộng dồn: không cho áp 2 KM MuaXTangY trong cùng 1 đơn
+                if self._applied_km and self._applied_km.get("_mxy") and self._applied_km["id"] != sel["id"]:
+                    QMessageBox.warning(
+                        dlg, "Không thể cộng dồn",
+                        "Đơn này đã áp dụng 1 ưu đãi Mua X Tặng Y rồi.\n\n"
+                        "Mỗi đơn hàng chỉ được áp dụng 1 ưu đãi loại này.\n"
+                        "Bấm '❌ Bỏ KM' trước nếu muốn đổi sang ưu đãi khác."
+                    )
                     return
-                if diem_can > 0 and kh_diem < diem_can:
-                    QMessageBox.warning(dlg, "Không đủ điểm",
-                        f"Khách có {kh_diem:,} điểm, cần {diem_can:,} điểm!")
+                if not sel["du_dk"]:
+                    QMessageBox.warning(
+                        dlg, "Chưa đủ điều kiện",
+                        f"⚠️ {sel['msg']}\n\n"
+                        f"Cần ít nhất {sel['sl_can_mua']}× {sel['ten_x']} trong hóa đơn."
+                    )
                     return
+                # Xóa quà cũ nếu có, thêm quà mới
+                self.order_table.remove_gifts()
+                self.order_table.add_gift(sel["ten_y"] + " (Quà tặng)", sel["tong_tang"])
+                self._applied_km = sel
+                self._km_user_picked = True
+                self._applied_voucher_id = None
+                self._km_discount = 0.0
+                self.update_grand_total()
+                _log(self.user.id, "Áp dụng KM MuaXTangY",
+                     f"{sel['ten']}: tặng {sel['tong_tang']}× {sel['ten_y']}",
+                     o_dau="POS - Thanh toán")
+                dlg.accept()
+                return
 
-            # Kiểm tra Voucher: phải đúng KH
+            # Kiểm tra KM đổi điểm: phải đúp chuột đổi trước
+            if sel.get("loai_nhom") == "DoiDiem":
+                QMessageBox.information(dlg, "Cần đổi điểm trước",
+                    "Ưu đãi này yêu cầu đổi điểm.\n\n"
+                    "Vui lòng <b>đúp chuột</b> vào dòng ưu đãi đó để đổi điểm "
+                    "→ hệ thống sẽ tạo voucher cá nhân cho khách.\n\n"
+                    "Sau đó chọn voucher vừa tạo ở mục "
+                    "\"Voucher cá nhân\" rồi ấn Áp dụng.")
+                return
+
+            # Kiểm tra Voucher
             if sel.get("loai_nhom") == "Voucher" and not kh_id:
                 QMessageBox.warning(dlg, "Cần KH liên kết",
                     "Voucher cá nhân yêu cầu liên kết số điện thoại khách hàng!")
                 return
 
+            # Bỏ quà tặng cũ nếu chuyển sang KM khác
+            self.order_table.remove_gifts()
+
             self._applied_km = sel
             self._km_user_picked = True
-            # Đánh dấu voucher nếu là Voucher
             self._applied_voucher_id = sel["id"] if sel.get("loai_nhom") == "Voucher" else None
             self.update_grand_total()
 
@@ -1649,6 +2109,7 @@ class POSWindow(QMainWindow):
 
         def _do_remove():
             old = self._applied_km["ten"] if self._applied_km else "—"
+            self.order_table.remove_gifts()   # xóa quà tặng MuaXTangY nếu có
             self._applied_km = None
             self._km_discount = 0
             self._km_user_picked = False
@@ -1847,6 +2308,13 @@ class POSWindow(QMainWindow):
         order_items = []
         grand_total = 0
         for it in raw_items:
+            if it.get("is_gift"):
+                # Dòng quà tặng MuaXTangY — price=0, không tính vào tổng
+                order_items.append({
+                    'name': it['name'], 'qty': it['qty'],
+                    'price': 0, 'note': '🎁 Quà tặng KM',
+                })
+                continue
             parts = []
             if it.get("topping") and it["topping"] != "Không topping":
                 parts.append(it["topping"])
@@ -2476,40 +2944,53 @@ class POSWindow(QMainWindow):
     def logout(self):
         """
         Thoát phiên đăng nhập.
-        Safety-net: nếu chưa check-out, cảnh báo và cho phép
-        thực hiện check-out + đăng xuất gộp hoặc huỷ.
+        - Nếu nhân viên có ca đang mở mà chưa check-out thủ công:
+            → Hiện cảnh báo nhắc nhở (3 nút: Check-out rồi xuất / Xuất luôn / Huỷ)
+            → KHÔNG bắt buộc phải check-out mới được đăng xuất.
+        - Admin: bỏ qua kiểm tra ca, cho đăng xuất thẳng.
         """
         from utils.session_manager import clear_session
 
         role = getattr(self.user, 'chuc_vu', '') or ''
 
-        # ── Safety-net: chưa check-out ──────────────────────────────
-        # Luôn kiểm tra thực tế từ DB thay vì tin vào flag _co_ca (có thể stale)
+        # ── Kiểm tra ca đang mở (chỉ với nhân viên chưa tự check-out) ──
         co_ca_dang_mo = False
         if not self._da_checkout and role != "Admin":
             try:
                 from controllers.auth_controller import lay_ca_dang_mo
                 co_ca_dang_mo = bool(lay_ca_dang_mo(self.user.id))
             except Exception:
-                co_ca_dang_mo = self._co_ca  # fallback
+                co_ca_dang_mo = getattr(self, '_co_ca', False)
 
-        if co_ca_dang_mo and not self._da_checkout and role != "Admin":
-            reply = QMessageBox.warning(
-                self, "Chưa Check-out Ca",
-                "⚠️ Bạn chưa check-out ca làm việc!\n\n"
-                "Xác nhận check-out và đăng xuất ngay bây giờ?",
-                QMessageBox.Yes | QMessageBox.Cancel,
-                QMessageBox.Cancel
+        if co_ca_dang_mo:
+            # Nhắc nhở — 3 lựa chọn, KHÔNG bắt buộc
+            msg = QMessageBox(self)
+            msg.setWindowTitle("⚠️ Chưa Check-out Ca")
+            msg.setIcon(QMessageBox.Warning)
+            msg.setText(
+                "Bạn <b>chưa check-out ca làm việc</b>.<br><br>"
+                "Nên check-out trước để ghi nhận giờ ra chính xác.<br>"
+                "Bạn muốn làm gì?"
             )
-            if reply == QMessageBox.Cancel:
-                return
-            self.handle_ca_checkout()
-            if not self._da_checkout:
-                # handle_ca_checkout đã hiện lỗi → chỉ dừng lại
-                return
-        # Không có ca đang mở → bỏ qua safety-net, cho phép đăng xuất thẳng
+            btn_co_checkout = msg.addButton("✅ Check-out rồi Đăng xuất", QMessageBox.AcceptRole)
+            btn_xuat_luon   = msg.addButton("🚪 Đăng xuất luôn",          QMessageBox.DestructiveRole)
+            btn_huy         = msg.addButton("Huỷ",                         QMessageBox.RejectRole)
+            msg.setDefaultButton(btn_co_checkout)
+            msg.exec()
 
-        # ── Xác nhận đăng xuất thông thường ─────────────────────
+            clicked = msg.clickedButton()
+            if clicked == btn_huy:
+                return  # Huỷ → ở lại
+
+            if clicked == btn_co_checkout:
+                # Thực hiện check-out thủ công, nếu lỗi vẫn tiếp tục đăng xuất
+                try:
+                    self.handle_ca_checkout()
+                except Exception:
+                    pass
+            # btn_xuat_luon hoặc sau check-out → tiếp tục đăng xuất
+
+        # ── Xác nhận đăng xuất ───────────────────────────────────
         confirm = QMessageBox.question(
             self, "Đăng xuất",
             "Bạn có chắc chắn muốn đăng xuất?",
@@ -2522,7 +3003,7 @@ class POSWindow(QMainWindow):
              f"{self.user.ten_nv} đăng xuất khỏi màn hình bán hàng",
              o_dau="POS")
 
-        # Gọi logout_user để đóng phiên trên server (nếu chưa checkout riêng)
+        # Gọi logout_user để đóng phiên (tự ghi giờ ra nếu còn ca chưa checkout)
         try:
             from controllers.auth_controller import logout_user
             logout_user(self.user, ma_phien=self.ma_phien)

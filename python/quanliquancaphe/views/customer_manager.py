@@ -629,12 +629,39 @@ class RedeemDialog(QDialog):
             if km_obj:
                 km_obj.so_luot_da_dung = (km_obj.so_luot_da_dung or 0) + 1
 
+            # ── TẠO VOUCHER CÁ NHÂN cho khách này ──────────────────
+            # Voucher gắn với ma_kh → chỉ khách này thấy & dùng được
+            from datetime import timedelta
+            vc_code = gen_code("VD")   # VD = Voucher Đổi điểm
+            het_han = date.today() + timedelta(days=90)   # hiệu lực 90 ngày
+            vc = Voucher(
+                ma_kh         = self.kh_id,
+                ma_code       = vc_code,
+                ten_voucher   = f"[Đổi điểm] {ten}",
+                loai_giam     = d["kieu"] if d["kieu"] in ("PhanTram", "TienMat") else "TienMat",
+                gia_tri_giam  = d["gia_tri"],
+                toi_da_giam   = d["tran"],
+                dieu_kien_toi_thieu = d.get("dk_min", 0) or 0,
+                ngay_het_han  = het_han,
+                trang_thai    = "Chưa dùng",
+            )
+            # Gắn ma_km nếu model có cột đó
+            try:
+                vc.ma_km = d["id"]
+            except Exception:
+                pass
+            s.add(vc)
+            # ────────────────────────────────────────────────────────
+
             s.commit()
             QMessageBox.information(
                 self, "✅ Thành công",
-                f"Đã đổi {'<b>' + str(diem_tru) + '</b> điểm' if diem_tru > 0 else 'ưu đãi'} "
-                f"cho khách!\n\nƯu đãi: {ten}\n"
-                f"Điểm còn lại: {kh.diem_tich_luy:,}"
+                f"Đã đổi {diem_tru:,} điểm thành công!\n\n"
+                f"Ưu đãi: {ten}\n"
+                f"Mã voucher cá nhân: {vc_code}\n"
+                f"Hiệu lực đến: {het_han.strftime('%d/%m/%Y')}\n"
+                f"Điểm còn lại: {kh.diem_tich_luy:,}\n\n"
+                f"Voucher đã được lưu vào tài khoản khách hàng."
             )
             self.accept()
         except Exception as e:

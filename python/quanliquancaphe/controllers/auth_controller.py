@@ -23,8 +23,17 @@ def _tinh_checkin(now: datetime, cc: ChamCong) -> dict:
 
 
 def _tinh_checkout(now: datetime, cc: ChamCong) -> dict:
+    """
+    Tính trạng thái khi check-out.
+    - Giữ nguyên phut_tre đã ghi lúc check-in (không trả về, không ghi đè).
+    - Ve_som : check-out sớm hơn (gio_kt_ca - PHUT_VE_SOM) phút
+    - Tang_ca: check-out muộn hơn (gio_kt_ca + PHUT_TANG_CA) phút
+    - Hoan_thanh / Di_tre: trong khoảng cho phép (giữ trạng thái Di_tre nếu đã trễ)
+    """
     if cc.gio_kt_ca is None:
-        return {"trang_thai": "Hoan_thanh", "phut_ve_som": 0, "phut_tang_ca": 0}
+        # Không có ca → giữ trạng thái check-in (Di_tre / Dang_lam)
+        tt = "Di_tre" if cc.trang_thai == "Di_tre" else "Hoan_thanh"
+        return {"trang_thai": tt, "phut_ve_som": 0, "phut_tang_ca": 0}
     ket_thuc_dt = datetime.combine(cc.ngay, cc.gio_kt_ca)
     if cc.gio_bd_ca and cc.gio_kt_ca < cc.gio_bd_ca:
         ket_thuc_dt += timedelta(days=1)
@@ -32,24 +41,45 @@ def _tinh_checkout(now: datetime, cc: ChamCong) -> dict:
     moc_tang_ca = ket_thuc_dt + timedelta(minutes=PHUT_TANG_CA)
     if now < duoc_ve_som:
         phut = max(0, int((duoc_ve_som - now).total_seconds() // 60))
-        return {"trang_thai": "Ve_som", "phut_ve_som": phut, "phut_tang_ca": 0}
+        # Về sớm + đã trễ → ghi cả 2 (phut_tre giữ nguyên từ check-in)
+        tt = "Ve_som"
+        return {"trang_thai": tt, "phut_ve_som": phut, "phut_tang_ca": 0}
     elif now > moc_tang_ca:
         phut = max(0, int((now - ket_thuc_dt).total_seconds() // 60))
-        return {"trang_thai": "Tang_ca", "phut_ve_som": 0, "phut_tang_ca": phut}
+        # Tăng ca → giữ trạng thái Di_tre nếu đã trễ, ngược lại Tang_ca
+        tt = "Di_tre" if cc.trang_thai == "Di_tre" else "Tang_ca"
+        return {"trang_thai": tt, "phut_ve_som": 0, "phut_tang_ca": phut}
     else:
+        # Đúng giờ → giữ Di_tre nếu đã trễ
         tt = "Di_tre" if cc.trang_thai == "Di_tre" else "Hoan_thanh"
         return {"trang_thai": tt, "phut_ve_som": 0, "phut_tang_ca": 0}
 
 
 def _ca_khop_gio(ca: CaLamViec, now: datetime) -> bool:
+    """
+    Ca hợp lệ để check-in khi:
+      • now >= (gio_bat_dau − 15 phút)   [cho phép vào sớm tối đa 15 phút]
+      • now <= (gio_bat_dau + 60 phút)   [quá 60 phút sau giờ bắt đầu → không nhận nữa]
+    Giới hạn 60 phút sau giúp tránh nhân viên ca chiều vô tình check-in nhầm ca sáng.
+    """
     if not ca.gio_bat_dau or not ca.gio_ket_thuc:
         return False
-    today  = now.date()
-    mo_cua = (datetime.combine(today, ca.gio_bat_dau) - timedelta(minutes=PHUT_VAO_SOM)).time()
-    now_t  = now.time()
-    if ca.gio_bat_dau <= ca.gio_ket_thuc:
-        return mo_cua <= now_t <= ca.gio_ket_thuc
-    return now_t >= mo_cua or now_t <= ca.gio_ket_thuc
+
+    today     = now.date()
+    bat_dau   = datetime.combine(today, ca.gio_bat_dau)
+
+    # Cửa sổ hợp lệ: [bat_dau - 15 phút, bat_dau + 60 phút]
+    mo_cua    = bat_dau - timedelta(minutes=PHUT_VAO_SOM)   # sớm nhất được check-in
+    dong_cua  = bat_dau + timedelta(minutes=60)             # muộn nhất được check-in
+
+    # Xử lý ca qua đêm: nếu gio_ket_thuc < gio_bat_dau thì ca này qua sang ngày hôm sau
+    ket_thuc  = datetime.combine(today, ca.gio_ket_thuc)
+    if ca.gio_ket_thuc < ca.gio_bat_dau:
+        ket_thuc += timedelta(days=1)
+        # Ca qua đêm: cửa sổ check-in vẫn tính từ bat_dau ngày hôm nay
+        return mo_cua <= now <= dong_cua
+
+    return mo_cua <= now <= dong_cua
 
 
 def _lay_ca_phan_cong(session, ma_nv: int, today: date) -> list[CaLamViec]:
@@ -214,6 +244,7 @@ def checkout_ca(ma_cham_cong: int) -> tuple[bool, str]:
         cc.trang_thai    = info["trang_thai"]
         cc.phut_ve_som   = info["phut_ve_som"]
         cc.phut_tang_ca  = info["phut_tang_ca"]
+        # Giữ nguyên phut_tre đã ghi lúc check-in — không ghi đè
 
         if cc.ma_phien:
             phien = session.get(PhienLamViec, cc.ma_phien)
@@ -314,15 +345,20 @@ def lay_tat_ca_hom_nay(ma_nv: int) -> list[dict]:
 
 # ── ĐĂNG XUẤT ────────────────────────────────────────────────────────────────
 def logout_user(user: NhanVien, ma_phien: int = None):
-    """Checkout tất cả ca đang mở (Dang_lam/Di_tre) rồi đóng PhienLamViec.
-    Với bản ghi Khong_ca: chỉ ghi thoi_gian_ra, giữ trạng thái Khong_ca."""
+    """
+    Đóng phiên làm việc khi đăng xuất.
+
+    Chính sách:
+    - KHÔNG tự động checkout ca có lịch (Dang_lam / Di_tre).
+      Nhân viên phải tự check-out thủ công qua nút "Check-out Ca".
+      (UI sẽ nhắc nhở nhưng KHÔNG bắt buộc trước khi đăng xuất.)
+    - Chỉ ghi thoi_gian_ra cho bản ghi Khong_ca (nhân viên tự do, không ca).
+    - Đóng PhienLamViec.
+    """
     if user:
         ghi_nhat_ky_dang_nhap(ten_dang_nhap=user.ten_dang_nhap,
             hanh_dong="Đăng xuất", ket_qua="Thành công", ma_nv=user.id)
-        # Checkout ca đang làm (Dang_lam / Di_tre)
-        for ca in lay_ca_dang_mo(user.id):
-            checkout_ca(ca["id"])
-        # Ghi giờ ra cho bản ghi Khong_ca (nếu có) — không đổi trạng thái
+        # Chỉ ghi giờ ra cho bản ghi Khong_ca — không tự checkout ca có lịch
         _ghi_ra_khong_ca(user.id)
 
     if ma_phien:
@@ -356,6 +392,50 @@ def _ghi_ra_khong_ca(ma_nv: int):
             session.commit()
     except Exception:
         session.rollback()
+    finally:
+        session.close()
+
+
+
+# ── KIỂM TRA VẮNG MẶT (quá 50% ca chưa check-in) ────────────────────────────
+def kiem_tra_vang_mat():
+    """
+    Quét tất cả ChamCong hôm nay còn 'Chua_checkin'.
+    Nếu now > gio_bd_ca + 50% tổng thời gian ca → đánh dấu 'Vang_mat'.
+    Nên gọi định kỳ (mỗi 5-10 phút) hoặc khi mở app.
+    """
+    session = get_session()
+    try:
+        now   = datetime.now()
+        today = date.today()
+        ccs = (session.query(ChamCong)
+               .filter(ChamCong.ngay == today,
+                       ChamCong.trang_thai == "Chua_checkin",
+                       ChamCong.thoi_gian_vao.is_(None)).all())
+        changed = 0
+        for cc in ccs:
+            if not cc.gio_bd_ca or not cc.gio_kt_ca:
+                continue
+            bat_dau_dt  = datetime.combine(today, cc.gio_bd_ca)
+            ket_thuc_dt = datetime.combine(today, cc.gio_kt_ca)
+            if cc.gio_kt_ca < cc.gio_bd_ca:          # ca qua đêm
+                ket_thuc_dt += timedelta(days=1)
+            tong_phut = (ket_thuc_dt - bat_dau_dt).total_seconds() / 60
+            if tong_phut <= 0:
+                continue
+            nguong_vang = bat_dau_dt + timedelta(minutes=tong_phut * 0.5)
+            if now >= nguong_vang:
+                cc.trang_thai = "Vang_mat"
+                cc.ghi_chu    = (cc.ghi_chu or "") + (
+                    f" [Tự động: vắng sau {int(tong_phut*0.5)}p không check-in]"
+                )
+                changed += 1
+        if changed:
+            session.commit()
+        return changed
+    except Exception:
+        session.rollback()
+        return 0
     finally:
         session.close()
 

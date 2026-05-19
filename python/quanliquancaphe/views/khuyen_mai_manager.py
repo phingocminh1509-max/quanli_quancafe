@@ -461,29 +461,38 @@ class KhuyenMaiForm(QDialog):
         self._select_nhom(self._nhom_hien_tai)
 
     def _auto_gen_code(self, ten: str):
-        """Tự động tạo mã code từ tên KM nếu ô code đang trống hoặc chưa chỉnh."""
+        """Tự động tạo mã code từ tên KM khi ô code đang trống và chưa chỉnh tay."""
         if self.km_id:          # Đang sửa → không ghi đè
             return
         if self._code_edited:   # User đã tự gõ → không ghi đè
             return
         ten = ten.strip()
         if not ten:
+            # Tên bị xóa hết → xóa code nếu chưa ai chỉnh
+            self._block_code_signal = True
             self.txt_code.setText("")
+            self._block_code_signal = False
+            self._code_base = ""   # reset để sinh lại khi gõ tiếp
             return
 
         import unicodedata, re as _re
         # Bỏ dấu tiếng Việt
         nfkd = unicodedata.normalize('NFKD', ten)
         ascii_str = ''.join(c for c in nfkd if not unicodedata.combining(c))
-        # Chỉ giữ chữ/số, viết hoa
         words = _re.findall(r'[A-Za-z0-9]+', ascii_str)
         if not words:
             return
-        # Lấy chữ cái đầu các từ + thêm số ngẫu nhiên ngắn
-        import random
         prefix = ''.join(w[:3].upper() for w in words[:3])
-        suffix = str(random.randint(10, 99))
-        code = prefix + suffix          # VD: GIA10, CUOITUAN22, KM15
+
+        # Chỉ sinh suffix ngẫu nhiên 1 lần — giữ nguyên khi user tiếp tục gõ
+        # _code_base lưu prefix lần trước; nếu prefix thay đổi → sinh suffix mới
+        prev_base = getattr(self, '_code_base', '')
+        if prefix != prev_base:
+            import random
+            self._code_suffix = str(random.randint(10, 99))
+            self._code_base   = prefix
+
+        code = prefix + self._code_suffix
         self._block_code_signal = True
         self.txt_code.setText(code)
         self._block_code_signal = False
@@ -495,7 +504,10 @@ class KhuyenMaiForm(QDialog):
         ten  = self.txt_ten.text().strip()
         loai = self.cb_loai.currentText()
         kieu = self.cb_kieu.currentText()
-        gt   = int(self.sp_gt.text() or 0)
+        try:
+            gt = int(self.sp_gt.text().replace(",", "") or 0)
+        except (ValueError, AttributeError):
+            gt = 0
 
         if not ten:
             return
@@ -1015,9 +1027,9 @@ class KhuyenMaiManagerDialog(QDialog):
         root.addLayout(filter_row)
 
         # ── Bảng thống nhất ──────────────────────────────────────
+        # Col: ID, Loại, Tên, Mô tả, Mã Code, Ưu đãi, Hết hạn, Trạng thái, ĐK
         COLS = ["ID", "Loại", "Tên Khuyến Mãi", "Mô tả",
-                "Mã Code", "Ưu đãi", "Điều kiện",
-                "Khung giờ", "Hết hạn", "Trạng thái"]
+                "Mã Code", "Ưu đãi", "Hết hạn", "Trạng thái", "ĐK"]
         self.table = QTableWidget(0, len(COLS))
         self.table.setHorizontalHeaderLabels(COLS)
         hh = self.table.horizontalHeader()
@@ -1029,8 +1041,7 @@ class KhuyenMaiManagerDialog(QDialog):
         hh.setSectionResizeMode(5, QHeaderView.ResizeToContents)
         hh.setSectionResizeMode(6, QHeaderView.ResizeToContents)
         hh.setSectionResizeMode(7, QHeaderView.ResizeToContents)
-        hh.setSectionResizeMode(8, QHeaderView.ResizeToContents)
-        hh.setSectionResizeMode(9, QHeaderView.ResizeToContents)
+        hh.setSectionResizeMode(8, QHeaderView.Fixed);   self.table.setColumnWidth(8, 36)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.table.verticalHeader().setVisible(False)
@@ -1138,55 +1149,132 @@ class KhuyenMaiManagerDialog(QDialog):
                 # Col 4: Mã code
                 self.table.setItem(i, 4, _it(km.ma_code or "—", "#F1C40F"))
 
-                # Col 5: Ưu đãi
+                # Col 5: Ưu đãi — viết rõ nghĩa
+                try:
+                    from database.models import SanPham as _SP
+                    _sx = s.get(_SP, km.ma_sp)      if km.ma_sp      else None
+                    _sy = s.get(_SP, km.ma_sp_tang) if km.ma_sp_tang else None
+                    ten_x = _sx.ten_sp if _sx else None
+                    ten_y = _sy.ten_sp if _sy else None
+                except Exception:
+                    ten_x = ten_y = None
+
                 if km.loai_km == "MuaXTangY":
-                    gt_str = f"Mua {km.so_luong_mua or 1} → Tặng {km.so_luong_tang or 1}"
+                    sl_x  = int(km.so_luong_mua  or 1)
+                    sl_y  = int(km.so_luong_tang or 1)
+                    sp_x  = ten_x or f"SP#{km.ma_sp}"
+                    sp_y  = ten_y or f"SP#{km.ma_sp_tang}"
+                    gt_str   = f"Mua {sl_x} {sp_x}  →  Tặng {sl_y} {sp_y}"
                     gt_color = "#27AE60"
+
                 elif km.kieu_giam == "PhanTram":
-                    gt_str = f"−{int(km.gia_tri_giam or 0)}%"
-                    if km.toi_da_giam:
-                        gt_str += f"  (max {int(km.toi_da_giam):,}đ)"
+                    pct  = int(km.gia_tri_giam or 0)
+                    tran = int(km.toi_da_giam or 0)
+                    # Phạm vi áp dụng
+                    if km.loai_km == "SanPham" and ten_x:
+                        pham_vi = f"cho {ten_x}"
+                    elif getattr(km, 'danh_muc', None):
+                        pham_vi = f"cho danh mục {km.danh_muc}"
+                    else:
+                        pham_vi = "cho toàn đơn"
+                    gt_str   = f"Giảm {pct}% {pham_vi}"
+                    if tran:
+                        gt_str += f"  (tối đa {tran:,}đ)"
                     gt_color = "#2ECC71"
+
                 elif km.kieu_giam == "TienMat":
-                    gt_str = f"−{int(km.gia_tri_giam or 0):,}đ"
+                    tien = int(km.gia_tri_giam or 0)
+                    if km.loai_km == "SanPham" and ten_x:
+                        pham_vi = f"cho {ten_x}"
+                    elif getattr(km, 'danh_muc', None):
+                        pham_vi = f"cho danh mục {km.danh_muc}"
+                    else:
+                        pham_vi = "cho toàn đơn"
+                    gt_str   = f"Giảm {tien:,}đ {pham_vi}"
                     gt_color = "#2ECC71"
+
                 else:
-                    gt_str = loai_map.get(km.loai_km, km.loai_km or "—")
+                    gt_str   = loai_map.get(km.loai_km, km.loai_km or "—")
                     gt_color = "#8888AA"
 
-                # Nếu là đổi điểm: prepend số điểm cần
+                # Đổi điểm: thêm số điểm cần ở đầu
                 if km_nhom == 'DoiDiem':
                     diem = int(getattr(km, 'diem_can', 0) or 0)
-                    gt_str = f"🌟 {diem:,} đ.  →  {gt_str}"
+                    gt_str = f"Dùng {diem:,} điểm  →  {gt_str}"
 
-                self.table.setItem(i, 5, _it(gt_str, gt_color))
+                it_gt = _it(gt_str, gt_color)
+                it_gt.setToolTip(gt_str)
+                self.table.setItem(i, 5, it_gt)
 
-                # Col 6: Điều kiện
-                dk = km.dk_tong_tien_tu
-                dk_str = f"≥ {int(dk):,}đ" if dk else "—"
-                self.table.setItem(i, 6, _it(dk_str))
+                # Tổng hợp điều kiện — chỉ lưu vào data, không hiện cột riêng
+                _dk = []
+                if km.loai_km == "MuaXTangY":
+                    _dk.append(f"Mua ≥{int(km.so_luong_mua or 1)}× {ten_x if km.loai_km == 'MuaXTangY' else '?'}")
+                elif km.dk_tong_tien_tu:
+                    _dk.append(f"Đơn tối thiểu: ≥{int(km.dk_tong_tien_tu):,}đ")
+                if km.ngay_bat_dau:   _dk.append(f"Ngày bắt đầu: {km.ngay_bat_dau.strftime('%d/%m/%Y')}")
+                if km.ngay_ket_thuc:  _dk.append(f"Ngày kết thúc: {km.ngay_ket_thuc.strftime('%d/%m/%Y')}")
+                if km.so_luot_toi_da: _dk.append(f"Giới hạn lượt: {int(km.so_luot_toi_da):,} lượt")
+                _gt2 = getattr(km,"gio_tu",None); _gd2 = getattr(km,"gio_den",None)
+                if _gt2 and _gd2: _dk.append(f"Khung giờ: {_gt2.strftime('%H:%M')}–{_gd2.strftime('%H:%M')}")
+                _dc2 = int(getattr(km,"diem_can",0) or 0)
+                if _dc2: _dk.append(f"Điểm cần: {_dc2:,} điểm")
+                _dk_text = "\n".join(f"• {d}" for d in _dk) if _dk else "Không có điều kiện đặc biệt"
 
-                # Col 7: Khung giờ
-                gio_tu  = getattr(km, 'gio_tu',  None)
-                gio_den = getattr(km, 'gio_den', None)
-                gio_str = (
-                    f"{gio_tu.strftime('%H:%M')}–{gio_den.strftime('%H:%M')}"
-                    if gio_tu and gio_den else "—"
-                )
-                self.table.setItem(i, 7, _it(gio_str, "#3498DB"))
-
-                # Col 8: Hết hạn
+                # Col 6: Hết hạn
                 het = km.ngay_ket_thuc.strftime("%d/%m/%Y") if km.ngay_ket_thuc else "Không hạn"
-                self.table.setItem(i, 8, _it(het))
+                self.table.setItem(i, 6, _it(het))
 
-                # Col 9: Trạng thái
+                # Col 7: Trạng thái
                 tt = km.trang_thai or "Đang chạy"
                 tt_color = {
                     "Đang chạy": "#2ECC71",
                     "Tạm dừng":  "#F1C40F",
                     "Hết hạn":   "#E74C3C",
                 }.get(tt, "white")
-                self.table.setItem(i, 9, _it(tt, tt_color, Qt.AlignCenter))
+                self.table.setItem(i, 7, _it(tt, tt_color, Qt.AlignCenter))
+
+                # Col 8: Nút ĐK — click hiện popup điều kiện chi tiết
+                has_dk = bool(_dk)
+                btn_dk = QPushButton("📋" if has_dk else "—")
+                btn_dk.setFixedSize(30, 26)
+                btn_dk.setToolTip(_dk_text)
+                btn_dk.setStyleSheet(
+                    f"background:{"#1D4E89" if has_dk else "transparent"}; "
+                    f"color:{"#5DADE2" if has_dk else "#555566"}; "
+                    "border:none; border-radius:5px; font-size:14px; padding:0;"
+                )
+                # Đóng gói _dk_text vào closure
+                def _make_dk_handler(km_ten, dk_txt):
+                    def _show():
+                        dlg_dk = QDialog(self)
+                        dlg_dk.setWindowTitle(f"📋 Điều kiện — {km_ten}")
+                        dlg_dk.resize(380, 220)
+                        dlg_dk.setStyleSheet(
+                            "QDialog{background:#1E1E2E;color:white;}"
+                            "QLabel{background:transparent;font-size:13px;color:#E8E8F0;}"
+                            "QPushButton{background:#34495E;color:white;border-radius:6px;"
+                            " padding:6px 18px;font-weight:bold;}"
+                        )
+                        vl = QVBoxLayout(dlg_dk)
+                        vl.setContentsMargins(20, 16, 20, 16); vl.setSpacing(10)
+                        lbl_title = QLabel(f"<b style='color:#E67E22;'>📋 {km_ten}</b>")
+                        lbl_title.setTextFormat(Qt.RichText)
+                        vl.addWidget(lbl_title)
+                        lbl_body = QLabel(dk_txt)
+                        lbl_body.setWordWrap(True)
+                        lbl_body.setStyleSheet(
+                            "background:#252540;border-radius:8px;padding:12px;"
+                            "font-size:13px;color:#A0C4FF;line-height:1.6;"
+                        )
+                        vl.addWidget(lbl_body)
+                        btn_close = QPushButton("Đóng")
+                        btn_close.clicked.connect(dlg_dk.accept)
+                        vl.addWidget(btn_close, alignment=Qt.AlignRight)
+                        dlg_dk.exec()
+                    return _show
+                btn_dk.clicked.connect(_make_dk_handler(km.ten_km or "—", _dk_text))
+                self.table.setCellWidget(i, 8, btn_dk)
 
         finally:
             s.close()
@@ -1322,7 +1410,7 @@ def get_valid_khuyen_mai(tong_tien: float = 0) -> list:
                 reasons.append(f"Đã hết hạn ({km.ngay_ket_thuc.strftime('%d/%m/%Y')})")
 
             # Lượt dùng
-            luot = km.so_luot_su_dung
+            luot = km.so_luot_toi_da
             if luot:
                 from database.models import NhatKyKhuyenMai as _NK
                 used = s.query(_NK).filter_by(ma_km=km.id).count()

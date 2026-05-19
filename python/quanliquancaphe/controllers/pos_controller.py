@@ -63,25 +63,37 @@ def process_checkout(
 
         # 4. Chi tiết từng món
         for item in order_items:
-            sp = session.query(SanPham).filter_by(ten_sp=item['name']).first()
+            # Dòng quà tặng MuaXTangY — tên có thể kèm " (Quà tặng)", price=0
+            # Tìm SP theo tên gốc (bỏ hậu tố " (Quà tặng)" nếu có)
+            ten_goc = item['name'].replace(" (Quà tặng)", "").strip()
+            sp = session.query(SanPham).filter_by(ten_sp=ten_goc).first()
+            if not sp:
+                # Thử tên nguyên gốc (phòng trường hợp không có hậu tố)
+                sp = session.query(SanPham).filter_by(ten_sp=item['name']).first()
             if not sp:
                 raise ValueError(f"Không tìm thấy sản phẩm: {item['name']}")
             ct = ChiTietHoaDon(
                 ma_hd      = hoa_don.id,
                 ma_sp      = sp.id,
                 so_luong   = item['qty'],
-                don_gia    = item['price'],
+                don_gia    = item['price'],        # 0 nếu là quà tặng
                 thanh_tien = item['qty'] * item['price'],
                 ghi_chu    = item.get('note') or None,
             )
             session.add(ct)
 
         # 5. Tăng lượt dùng KM nếu có
+        # Lưu ý: KM MuaXTangY đổi điểm đã được tăng so_luot_da_dung
+        # ngay lúc đổi điểm trong _on_dd_double_click → KHÔNG tăng thêm ở đây
+        # để tránh đếm 2 lần. Chỉ tăng với KM Chung (không qua đổi điểm).
         if km_id:
             from database.models import KhuyenMai
-            km = session.get(KhuyenMai, km_id)
-            if km:
-                km.so_luot_da_dung = (km.so_luot_da_dung or 0) + 1
+            km_obj = session.get(KhuyenMai, km_id)
+            if km_obj:
+                la_doi_diem = int(getattr(km_obj, 'la_doi_diem', 0) or 0)
+                if not la_doi_diem:
+                    # KM Chung thường — tăng lượt dùng tại đây
+                    km_obj.so_luot_da_dung = (km_obj.so_luot_da_dung or 0) + 1
 
         session.commit()
 
